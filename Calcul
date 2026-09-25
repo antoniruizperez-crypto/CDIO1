@@ -1,0 +1,37 @@
+import rasterio
+import numpy as np
+import matplotlib.pyplot as plt
+
+#Obrir banda verda (B03)
+with rasterio.open("Fotoprueba2.jp2") as src:
+    green = src.read(1)
+    profile = src.profile
+
+#Obrir banda infrarroja (B08)
+with rasterio.open("Nom_Real_de_B08.jp2") as src:
+    nir = src.read(1)
+
+#calcul de NDWI --> NDWI = (Green-NIR)/(Green+NIR)
+ndwi = np.divide(
+    green - nir,
+    green + nir,
+    out=np.zeros_like(green, dtype=np.float32),
+    where=(green + nir) != 0    #Evitar dividir entre zero
+)
+
+# Guardar el resultat
+profile.update(
+    dtype=rasterio.float32,
+    count=1
+)
+
+with rasterio.open("NDWI.tif", "w", **profile) as dst:
+    dst.write(ndwi, 1)
+
+#Printar la imatge del NDWI 
+plt.imshow(ndwi, cmap="RdYlBu")
+plt.colorbar(label="NDWI")
+plt.title("NDWI")
+plt.show()
+
+#Es rebrá un arxiu amb el NDWI i una finestra mostrant cada pixel segons el seu valor de NDWI.
