@@ -314,6 +314,7 @@ def main():
             print(
                 f"  Nubosidad: {resultado['porcentaje_nubosidad']}% "
                 f"- Pasa filtro: {resultado['paso_filtro']}"
+                f"- NDWI: {resultado['porcentaje_agua_ndwi']}"
             )
 
         os.rename(zip_path, os.path.join(CARPETA_PROCESADOS, nombre))
