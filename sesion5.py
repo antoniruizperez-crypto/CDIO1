@@ -1,23 +1,36 @@
 """
-Procesamiento por lotes de imágenes Sentinel-2 (nivel L2A).
+Procesamiento por lotes de imágenes Sentinel-2.
 
 Para cada .zip encontrado en CARPETA_ENTRADA:
-1. Localiza la banda SCL (20m) dentro del zip sin descomprimirlo.
-2. Calcula el % de nubosidad usando la clasificación de escena.
-3. Si pasa el filtro de nubosidad, genera un compuesto RGB de 10m
-   (B04/B03/B02) para visualización de costa.
+1. Detecta si el producto es L1C o L2A (por nombre de archivo o XML).
+2. Si es L2A: localiza la SCL (20m), calcula el % de nubosidad por
+   píxel y, si pasa el filtro, genera compuesto de costa (10m RGB),
+   NDWI (imagen coloreada + GeoTIFF continuo) y una máscara binaria
+   tierra/agua (waterbody.tif) en la carpeta del proyecto de costa
+   (Code/projects/<NOMBRE_PROYECTO>/output/estimated_waterbodies_images/),
+   lista para extract_shorelines.py.
+3. Si es L1C: lee el % de nubosidad global desde el XML de metadatos
+   (Cloud_Coverage_Assessment). Solo se usa para registro/filtrado;
+   no se generan imágenes, por la menor fiabilidad de la reflectancia
+   TOA sin corrección atmosférica y la falta de máscara por píxel.
 4. Registra el resultado de cada zip en un CSV.
 5. Mueve el zip procesado a otra carpeta para no repetirlo.
 
-Requiere: rasterio, numpy, pillow
-    pip install rasterio numpy pillow
+Requiere: rasterio, numpy, pillow, matplotlib, pyproj, shapely, pandas
+    pip install rasterio numpy pillow matplotlib pyproj shapely pandas
 (rasterio depende de GDAL; en la mayoría de sistemas se instala
  automáticamente junto con el paquete)
+
+Debe ejecutarse con el directorio de trabajo en la raíz del proyecto
+(la carpeta que contiene tanto Code/ como Imagenes/), y shoreline_utils.py
+debe estar en la misma carpeta que este script (Code/).
 """
 
 import os
 import csv
+import xml.etree.ElementTree as ET
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import rasterio
@@ -28,11 +41,14 @@ import matplotlib
 matplotlib.use("Agg")  # backend sin interfaz: nunca abre ventana, no bloquea el bucle
 import matplotlib.pyplot as plt
 
+# shoreline_utils.py debe vivir en la misma carpeta que este script
+import shoreline_utils as utils
+
 # ---------------------------------------------------------------------------
 # Configuración
 # ---------------------------------------------------------------------------
 
-CARPETA_ENTRADA = "Imagenes/zips-entrada"
+CARPETA_ENTRADA = "Imagenes/zips_entrada"
 CARPETA_PROCESADOS = "Imagenes/zips_procesados"
 CARPETA_SALIDA = "Imagenes/resultados"
 CSV_LOG = "Imagenes/registro_procesamiento.csv"
@@ -49,8 +65,13 @@ CLASE_NODATA = 0
 BANDAS_COSTA = ["B04", "B03", "B02"]  # Rojo, Verde, Azul
 
 # Umbral conservador de NDWI para considerar un píxel como agua
-# (por encima de 0 para reducir falsos positivos de humedad/sombra)
+# (se usa tanto para la estadística informativa como para el waterbody.tif)
 UMBRAL_NDWI_AGUA = 0.2
+
+# Proyecto de costa (carpeta bajo Code/projects/) usado por extract_shorelines.py
+# y calculate_erosion.py vía shoreline_utils.project_path
+NOMBRE_PROYECTO = "costa_principal"
+CARPETA_WATERBODY = utils.project_path(NOMBRE_PROYECTO) / "output" / "estimated_waterbodies_images"
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +97,55 @@ def ruta_vsizip(zip_path, ruta_interna):
     necesidad de descomprimirlo.
     """
     return f"/vsizip/{os.path.abspath(zip_path)}/{ruta_interna}"
+
+
+# ---------------------------------------------------------------------------
+# Detección de nivel de procesamiento (L1C / L2A)
+# ---------------------------------------------------------------------------
+
+def detectar_nivel_procesamiento(zip_path):
+    """
+    Determina si el producto es L1C o L2A. Primero mira el nombre del zip
+    (convención oficial de la ESA: 'MSIL1C' / 'MSIL2A'), y si no es
+    concluyente, busca el XML de metadatos correspondiente dentro del zip.
+
+    Devuelve "L1C", "L2A" o "DESCONOCIDO".
+    """
+    nombre = os.path.basename(zip_path)
+
+    if "MSIL2A" in nombre:
+        return "L2A"
+    if "MSIL1C" in nombre:
+        return "L1C"
+
+    # Nombre no concluyente (p.ej. si el archivo fue renombrado):
+    # se busca el XML de metadatos propio de cada nivel.
+    if buscar_archivo_en_zip(zip_path, "MTD_MSIL2A.xml"):
+        return "L2A"
+    if buscar_archivo_en_zip(zip_path, "MTD_MSIL1C.xml"):
+        return "L1C"
+
+    return "DESCONOCIDO"
+
+
+def leer_nubosidad_xml_l1c(zip_path, ruta_xml):
+    """
+    Lee el % de nubosidad global de la escena desde el XML de metadatos
+    de un producto L1C (campo 'Cloud_Coverage_Assessment').
+
+    Es un único valor para todo el granulado (no una máscara por píxel),
+    calculado por la ESA.
+    """
+    with zipfile.ZipFile(zip_path) as z:
+        contenido = z.read(ruta_xml)
+
+    root = ET.fromstring(contenido)
+    for elemento in root.iter():
+        etiqueta = elemento.tag.split("}")[-1]  # quita el namespace XML
+        if etiqueta == "Cloud_Coverage_Assessment":
+            return float(elemento.text)
+
+    raise ValueError("No se encontró 'Cloud_Coverage_Assessment' en el XML del producto L1C")
 
 
 # ---------------------------------------------------------------------------
@@ -113,14 +183,21 @@ def calcular_porcentaje_nubosidad(zip_path, ruta_scl):
 # Lectura de bandas de 10m
 # ---------------------------------------------------------------------------
 
-def leer_banda(zip_path, ruta_interna):
+def leer_banda(zip_path, ruta_interna, con_profile=False):
     """
     Lee una banda dentro del zip y la devuelve como array float32.
     Se usa tanto para el compuesto de costa como para el NDWI, para no
     leer la misma banda (p.ej. B03) dos veces desde el zip.
+
+    Si con_profile=True, devuelve también el profile de rasterio (CRS,
+    transform, dimensiones) de esa banda, necesario para poder escribir
+    después un .tif georreferenciado (ndwi.tif, waterbody.tif).
     """
     with rasterio.open(ruta_vsizip(zip_path, ruta_interna)) as src:
-        return src.read(1).astype(np.float32)
+        datos = src.read(1).astype(np.float32)
+        if con_profile:
+            return datos, src.profile.copy()
+        return datos
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +257,35 @@ def calcular_porcentaje_agua(ndwi, umbral=UMBRAL_NDWI_AGUA):
     return float(np.mean(ndwi > umbral)) * 100
 
 
+def guardar_ndwi_tif(ndwi, salida_path, profile):
+    """
+    Guarda el NDWI continuo (-1 a 1) como GeoTIFF de una banda, reutilizando
+    el profile (CRS/transform) de la banda de origen. Es un producto de
+    trazabilidad/inspección, no lo requiere extract_shorelines.py.
+    """
+    # El profile viene de una banda .jp2 (driver JP2OpenJPEG), que no admite
+    # float32 ni otros tipos que sí soporta GeoTIFF. Hay que forzar el driver
+    # a GTiff explícitamente; la extensión del nombre de archivo no basta,
+    # GDAL usa el driver indicado en el profile.
+    perfil_salida = profile.copy()
+    perfil_salida.update(driver="GTiff", dtype=rasterio.float32, count=1)
+    with rasterio.open(salida_path, "w", **perfil_salida) as dst:
+        dst.write(ndwi.astype(np.float32), 1)
+
+
+def generar_waterbody(ndwi, salida_path, profile, umbral=UMBRAL_NDWI_AGUA):
+    """
+    Genera la máscara binaria tierra/agua que espera extract_shorelines.py:
+    una sola banda uint8 con valores exactos 0 (tierra) / 1 (agua),
+    georreferenciada con el mismo profile que la banda de origen.
+    """
+    waterbody = (ndwi > umbral).astype(np.uint8)
+    perfil_salida = profile.copy()
+    perfil_salida.update(driver="GTiff", dtype=rasterio.uint8, count=1, nodata=None)
+    with rasterio.open(salida_path, "w", **perfil_salida) as dst:
+        dst.write(waterbody, 1)
+
+
 def generar_visual_ndwi(ndwi, salida_path):
     """
     Guarda una imagen coloreada del NDWI con colorbar. Usa savefig (nunca
@@ -208,54 +314,121 @@ def procesar_zip(zip_path, carpeta_salida):
     resultado = {
         "zip": nombre_zip,
         "fecha_proceso": datetime.now().isoformat(timespec="seconds"),
+        "nivel_procesamiento": None,
         "porcentaje_nubosidad": None,
         "paso_filtro": None,
         "archivo_salida": None,
         "archivo_ndwi": None,
+        "archivo_ndwi_tif": None,
+        "archivo_waterbody": None,
         "porcentaje_agua_ndwi": None,
+        "observaciones": None,
         "error": None,
     }
 
     try:
-        ruta_scl = buscar_archivo_en_zip(zip_path, "_SCL_20m.jp2")
-        if ruta_scl is None:
-            raise FileNotFoundError("No se encontró la banda SCL (_SCL_20m.jp2) en el zip")
+        nivel = detectar_nivel_procesamiento(zip_path)
+        resultado["nivel_procesamiento"] = nivel
 
-        porcentaje, _desglose = calcular_porcentaje_nubosidad(zip_path, ruta_scl)
-        resultado["porcentaje_nubosidad"] = round(porcentaje, 2)
-        resultado["paso_filtro"] = porcentaje <= UMBRAL_NUBOSIDAD
+        if nivel == "L2A":
+            _procesar_l2a(zip_path, carpeta_salida, resultado)
 
-        if resultado["paso_filtro"]:
-            # Localiza en el zip todas las bandas de 10m que necesitamos:
-            # las de costa (RGB) más B08 (NIR) para el NDWI.
-            bandas_necesarias = list(dict.fromkeys(BANDAS_COSTA + ["B08"]))
-            rutas_bandas = {}
-            for banda in bandas_necesarias:
-                ruta = buscar_archivo_en_zip(zip_path, f"_{banda}_10m.jp2")
-                if ruta is None:
-                    raise FileNotFoundError(f"No se encontró la banda {banda} a 10m en el zip")
-                rutas_bandas[banda] = ruta
+        elif nivel == "L1C":
+            _procesar_l1c(zip_path, resultado)
 
-            # Se lee cada banda una sola vez y se reutiliza (B03 sirve
-            # tanto para el RGB de costa como para el NDWI).
-            bandas = {banda: leer_banda(zip_path, ruta) for banda, ruta in rutas_bandas.items()}
-
-            nombre_base = os.path.splitext(nombre_zip)[0]
-
-            nombre_costa = nombre_base + "_costa.jpg"
-            generar_visual_costa(bandas, os.path.join(carpeta_salida, nombre_costa))
-            resultado["archivo_salida"] = nombre_costa
-
-            ndwi = calcular_ndwi(bandas["B03"], bandas["B08"])
-            nombre_ndwi = nombre_base + "_ndwi.jpg"
-            generar_visual_ndwi(ndwi, os.path.join(carpeta_salida, nombre_ndwi))
-            resultado["archivo_ndwi"] = nombre_ndwi
-            resultado["porcentaje_agua_ndwi"] = round(calcular_porcentaje_agua(ndwi), 2)
+        else:
+            raise ValueError("No se pudo determinar el nivel de procesamiento (ni L1C ni L2A)")
 
     except Exception as e:
         resultado["error"] = str(e)
 
     return resultado
+
+
+def _procesar_l2a(zip_path, carpeta_salida, resultado):
+    """
+    Flujo completo para productos L2A: nubosidad vía SCL y, si pasa el
+    filtro, generación de compuesto de costa y NDWI.
+    """
+    ruta_scl = buscar_archivo_en_zip(zip_path, "_SCL_20m.jp2")
+    if ruta_scl is None:
+        raise FileNotFoundError("No se encontró la banda SCL (_SCL_20m.jp2) en el zip")
+
+    porcentaje, _desglose = calcular_porcentaje_nubosidad(zip_path, ruta_scl)
+    resultado["porcentaje_nubosidad"] = round(porcentaje, 2)
+    resultado["paso_filtro"] = porcentaje <= UMBRAL_NUBOSIDAD
+
+    if resultado["paso_filtro"]:
+        # Localiza en el zip todas las bandas de 10m que necesitamos:
+        # las de costa (RGB) más B08 (NIR) para el NDWI.
+        bandas_necesarias = list(dict.fromkeys(BANDAS_COSTA + ["B08"]))
+        rutas_bandas = {}
+        for banda in bandas_necesarias:
+            ruta = buscar_archivo_en_zip(zip_path, f"_{banda}_10m.jp2")
+            if ruta is None:
+                raise FileNotFoundError(f"No se encontró la banda {banda} a 10m en el zip")
+            rutas_bandas[banda] = ruta
+
+        # Se lee cada banda una sola vez y se reutiliza (B03 sirve tanto
+        # para el RGB de costa como para el NDWI). El profile (CRS,
+        # transform) se captura de la primera banda leída y es el mismo
+        # para todas, al ser todas bandas nativas de 10m del mismo tile.
+        bandas = {}
+        profile_10m = None
+        for banda, ruta in rutas_bandas.items():
+            if profile_10m is None:
+                bandas[banda], profile_10m = leer_banda(zip_path, ruta, con_profile=True)
+            else:
+                bandas[banda] = leer_banda(zip_path, ruta)
+
+        nombre_zip = resultado["zip"]
+        nombre_base = os.path.splitext(nombre_zip)[0]
+
+        nombre_costa = nombre_base + "_costa.jpg"
+        generar_visual_costa(bandas, os.path.join(carpeta_salida, nombre_costa))
+        resultado["archivo_salida"] = nombre_costa
+
+        ndwi = calcular_ndwi(bandas["B03"], bandas["B08"])
+
+        nombre_ndwi = nombre_base + "_ndwi.jpg"
+        generar_visual_ndwi(ndwi, os.path.join(carpeta_salida, nombre_ndwi))
+        resultado["archivo_ndwi"] = nombre_ndwi
+        resultado["porcentaje_agua_ndwi"] = round(calcular_porcentaje_agua(ndwi), 2)
+
+        # NDWI continuo como GeoTIFF (trazabilidad; no lo usa extract_shorelines.py)
+        nombre_ndwi_tif = nombre_base + "_ndwi.tif"
+        guardar_ndwi_tif(ndwi, os.path.join(carpeta_salida, nombre_ndwi_tif), profile_10m)
+        resultado["archivo_ndwi_tif"] = nombre_ndwi_tif
+
+        # Máscara binaria tierra/agua, en la carpeta que espera extract_shorelines.py.
+        # El nombre del zip se conserva intacto (solo se le añade un sufijo) para
+        # que shoreline_utils.extract_date siga encontrando la fecha en el nombre.
+        nombre_waterbody = nombre_base + "_waterbody.tif"
+        ruta_waterbody = CARPETA_WATERBODY / nombre_waterbody
+        generar_waterbody(ndwi, ruta_waterbody, profile_10m)
+        resultado["archivo_waterbody"] = nombre_waterbody
+
+
+def _procesar_l1c(zip_path, resultado):
+    """
+    Flujo reducido para productos L1C: sin SCL disponible, se usa el %
+    de nubosidad global del XML de metadatos solo para registro y
+    filtrado. No se generan imágenes de costa ni NDWI, porque la
+    reflectancia L1C (TOA, sin corrección atmosférica) y la ausencia de
+    una máscara de nubes por píxel hacen que esos productos sean menos
+    fiables que un L2A equivalente.
+    """
+    ruta_xml = buscar_archivo_en_zip(zip_path, "MTD_MSIL1C.xml")
+    if ruta_xml is None:
+        raise FileNotFoundError("No se encontró el XML de metadatos MTD_MSIL1C.xml en el zip")
+
+    porcentaje = leer_nubosidad_xml_l1c(zip_path, ruta_xml)
+    resultado["porcentaje_nubosidad"] = round(porcentaje, 2)
+    resultado["paso_filtro"] = porcentaje <= UMBRAL_NUBOSIDAD
+    resultado["observaciones"] = (
+        "L1C: % de nubosidad global desde XML (sin máscara por píxel); "
+        "no se generan imágenes de costa ni NDWI para este nivel."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -268,9 +441,10 @@ def escribir_registro(csv_path, filas):
     todavía no existe.
     """
     campos = [
-        "zip", "fecha_proceso", "porcentaje_nubosidad",
-        "paso_filtro", "archivo_salida",
-        "archivo_ndwi", "porcentaje_agua_ndwi", "error",
+        "zip", "fecha_proceso", "nivel_procesamiento",
+        "porcentaje_nubosidad", "paso_filtro", "archivo_salida",
+        "archivo_ndwi", "archivo_ndwi_tif", "archivo_waterbody",
+        "porcentaje_agua_ndwi", "observaciones", "error",
     ]
     existe = os.path.exists(csv_path)
 
@@ -289,6 +463,7 @@ def escribir_registro(csv_path, filas):
 def main():
     os.makedirs(CARPETA_SALIDA, exist_ok=True)
     os.makedirs(CARPETA_PROCESADOS, exist_ok=True)
+    os.makedirs(CARPETA_WATERBODY, exist_ok=True)
 
     if not os.path.isdir(CARPETA_ENTRADA):
         print(f"No existe la carpeta de entrada: {CARPETA_ENTRADA}")
@@ -312,9 +487,9 @@ def main():
             print(f"  ERROR: {resultado['error']}")
         else:
             print(
-                f"  Nubosidad: {resultado['porcentaje_nubosidad']}% "
+                f"  Nivel: {resultado['nivel_procesamiento']} "
+                f"- Nubosidad: {resultado['porcentaje_nubosidad']}% "
                 f"- Pasa filtro: {resultado['paso_filtro']}"
-                f"- NDWI: {resultado['porcentaje_agua_ndwi']}"
             )
 
         os.rename(zip_path, os.path.join(CARPETA_PROCESADOS, nombre))
