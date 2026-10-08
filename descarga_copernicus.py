@@ -31,7 +31,7 @@ import requests
 CDSE_USER = "antoni.ruiz.perez@estudiantat.upc.edu"
 CDSE_PASSWORD = "00Copernicus*"
 
-GEOJSON_PATH = "polygon.geojson"
+GEOJSON_PATH = "Code/projects/costa_principal/input/polygon.geojson"
 CARPETA_ENTRADA = "Imagenes/zips-entrada"
 CARPETA_PROCESADOS = "Imagenes/zips_procesados"
 
