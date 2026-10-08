@@ -2,6 +2,8 @@
 Descarga de imágenes Sentinel-2 L2A desde Copernicus Data Space Ecosystem
 (CDSE) para el área definida en un GeoJSON.
 
+Para correr el código ejecutamos en el terminal directamente: "python descarga_copernicus.py --inicio fechadesde --fin fechahasta"
+
 Los .zip se guardan en CARPETA_ENTRADA, listos para sesion5.py.
 
 Requiere: requests
@@ -31,8 +33,8 @@ import requests
 CDSE_USER = "antoni.ruiz.perez@estudiantat.upc.edu"
 CDSE_PASSWORD = "00Copernicus*"
 
-GEOJSON_PATH = "Code/projects/costa_principal/input/polygon.geojson"
-CARPETA_ENTRADA = "Imagenes/zips-entrada"
+GEOJSON_PATH = "projects/costa_principal/input/polygon.geojson"
+CARPETA_ENTRADA = "Imagenes/zips_entrada"
 CARPETA_PROCESADOS = "Imagenes/zips_procesados"
 
 # Filtro previo por nubosidad de TODA la escena (100x100 km). Es más laxo
