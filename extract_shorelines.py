@@ -205,17 +205,26 @@ def main(project, mask_dir=None, polygon_path=None, clean_dir=None, closing_radi
     aoi_proj = aoi_gdf.to_crs(raster_crs)
 
     processed = 0
+    skipped = 0
     for mask_file in tqdm(mask_files, desc="Extracting shoreline edges"):
         csv_xy_path = output_dir / f"{mask_file.stem}_xyz.csv"
-        if csv_xy_path.exists() and csv_xy_path.stat().st_size > 0:
-            processed += 1
+        clean_path = clean_dir / f"{mask_file.stem}_closed.tif"
+
+        # Solo se salta una máscara si ya tiene su CSV de bordes Y, cuando se
+        # guardan las máscaras limpias, también su _closed.tif. Si falta la
+        # máscara limpia, se recalcula (así los bordes antiguos, calculados
+        # sin closing, se regeneran con el closing aplicado).
+        csv_ok = csv_xy_path.exists() and csv_xy_path.stat().st_size > 0
+        clean_ok = (not SAVE_CLEAN_MASKS) or clean_path.exists()
+        if csv_ok and clean_ok:
+            skipped += 1
             continue
 
         if estimate_mask_edges(mask_file, aoi_proj, aoi_gdf, output_dir, clean_dir, closing_radius):
             processed += 1
 
     all_edges_csv_path = merge_edge_csvs(output_dir)
-    print(f"Processed {processed} mask files.")
+    print(f"Processed {processed} mask files ({skipped} skipped: already done).")
     if SAVE_CLEAN_MASKS:
         print(f"Clean masks saved in {clean_dir}")
     print(f"Wrote {all_edges_csv_path}")
