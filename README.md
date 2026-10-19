@@ -147,16 +147,8 @@ Estas ampliaciones no se presentan como implementadas en los módulos actuales.
 
 - Antoni Ruiz.
 - Joel Garcia.
-- .
-- Nombre y apellidos del integrante 4.
-
-### Contexto académico
-
-- Asignatura: CDIO1.
-- Titulación: Grado en Ingeniería de Satélites.
-- Centro: EETAC — Universitat Politècnica de Catalunya.
-
----
+- Jan .
+- Kaua Vieira.
 
 ## 🛰️ Estado del proyecto
 
