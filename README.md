@@ -146,8 +146,8 @@ Estas ampliaciones no se presentan como implementadas en los módulos actuales.
 
 
 - Antoni Ruiz.
-- 
-- Nombre y apellidos del integrante 3.
+- Joel Garcia.
+- .
 - Nombre y apellidos del integrante 4.
 
 ### Contexto académico
