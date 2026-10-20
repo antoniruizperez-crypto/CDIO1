@@ -1,4 +1,4 @@
-<h1 align="center"> Monitorización de la línea de costa</h1>
+<h1 align="center">Monitorización de la línea de costa</h1>
 
 <p align="center">
   Sentinel-2 · Copernicus · Procesamiento geoespacial · Python
@@ -19,7 +19,7 @@
 ---
 
 <a id="presentacion"></a>
-##  Presentación
+## Presentación
 
 Herramienta desarrollada en Python para estudiar la evolución de la línea de costa mediante imágenes Sentinel-2 obtenidas de Copernicus Data Space Ecosystem.
 
@@ -47,14 +47,14 @@ La zona de estudio configurada actualmente corresponde a un área costera de Bar
 5. [Productos y resultados](#resultados)
 6. [Primeros pasos](#primeros-pasos)
 7. [Tecnologías](#tecnologias)
-8. [Próxima fase · Sesión 9](#sesion-9)
+8. [Próximas ampliaciones](#ampliaciones)
 9. [Alcance y limitaciones](#limitaciones)
 10. [Equipo](#equipo)
 
 ---
 
 <a id="objetivo"></a>
-##  Objetivo
+## Objetivo
 
 Estudiar cómo cambia la posición de la línea de costa durante un período determinado y comparar su comportamiento entre distintos tramos de una misma zona.
 
@@ -68,19 +68,19 @@ Estudiar cómo cambia la posición de la línea de costa durante un período det
 > La interpretación de los desplazamientos como erosión o acreción requiere comprobar la orientación de los transectos, la referencia utilizada y la calidad de las observaciones.
 
 <a id="flujo-de-trabajo"></a>
-##  Flujo de trabajo
+## Flujo de trabajo
 
 <p align="center">
   Zona y fechas → Descarga → Procesamiento → Extracción → Medición → Visualización
 </p>
 
-### 01 ·  Adquisición de imágenes
+### 01 · Adquisición de imágenes
 
 El área de estudio se define mediante un polígono GeoJSON y se selecciona un intervalo de fechas.
 
 El programa consulta el catálogo de Copernicus, filtra productos Sentinel-2 L2A según su nubosidad y descarga los que todavía no están disponibles localmente.
 
-### 02 ·  Procesamiento y detección del agua
+### 02 · Procesamiento y detección del agua
 
 Para los productos L2A que superan el filtro, el sistema:
 
@@ -92,19 +92,19 @@ Para los productos L2A que superan el filtro, el sistema:
 
 La versión ampliada incorpora una apertura morfológica (`opening`) para reducir pequeñas regiones de agua y guarda comparaciones antes y después de su aplicación.
 
-### 03 ·  Extracción del borde
+### 03 · Extracción del borde
 
 El extractor puede aplicar un cierre morfológico (`closing`) y detecta los píxeles de transición agua-tierra dentro del área de estudio.
 
 Estos puntos se convierten en coordenadas, se exportan a CSV, GeoJSON y KMZ y se reúnen en una tabla con sus fechas.
 
-### 04 ·  Medición de desplazamientos
+### 04 · Medición de desplazamientos
 
 Se construye una costa de referencia y se generan transectos perpendiculares.
 
 Las intersecciones de los transectos con las costas de otras fechas permiten calcular distancias y obtener estadísticas por observación.
 
-### 05 ·  Visualización
+### 05 · Visualización
 
 Los resultados se representan mediante:
 
@@ -112,7 +112,7 @@ Los resultados se representan mediante:
 - Evolución temporal de la distancia media.
 - Gráficas de las geometrías y sus intersecciones.
 
-###  Validación con referencias externas
+### Validación con referencias externas
 
 Como comprobación independiente, el sistema puede comparar la costa estimada de una fecha con una referencia externa.
 
@@ -121,7 +121,7 @@ Se selecciona el archivo de referencia de fecha más próxima y se calculan las 
 ---
 
 <a id="funcionalidades"></a>
-##  Funcionalidades actuales
+## Funcionalidades actuales
 
 | Área | Funcionalidades |
 | :--- | :--- |
@@ -135,7 +135,7 @@ Se selecciona el archivo de referencia de fecha más próxima y se calculan las 
 | Registro | Información del procesamiento, productos generados y errores. |
 
 <a id="modulos"></a>
-##  Módulos del sistema
+## Módulos del sistema
 
 | Etapa | Archivo | Responsabilidad |
 | :--- | :--- | :--- |
@@ -150,7 +150,7 @@ Se selecciona el archivo de referencia de fecha más próxima y se calculan las 
 > Los procesadores por lotes son versiones alternativas de una misma etapa. No deben ejecutarse como dos pasos consecutivos sobre los mismos ZIP.
 
 <a id="resultados"></a>
-##  Productos y resultados
+## Productos y resultados
 
 ### Imágenes y máscaras
 
@@ -183,7 +183,7 @@ Los productos visuales del procesamiento se guardan también en `Imagenes/result
 ---
 
 <a id="primeros-pasos"></a>
-##  Primeros pasos
+## Primeros pasos
 
 ### Preparar el proyecto
 
@@ -202,10 +202,10 @@ Los productos visuales del procesamiento se guardan también en `Imagenes/result
 5. Visualizar las medidas.
 6. Realizar la validación si se dispone de referencias externas.
 
->  Las credenciales deben mantenerse fuera del código y del repositorio.
+> Las credenciales deben mantenerse fuera del código y del repositorio.
 
 <a id="tecnologias"></a>
-##  Tecnologías
+## Tecnologías
 
 | Área | Herramientas |
 | :--- | :--- |
@@ -222,10 +222,10 @@ Los productos visuales del procesamiento se guardan también en `Imagenes/result
 
 ---
 
-<a id="sesion-9"></a>
-##  Próxima fase · Sesión 9
+<a id="ampliaciones"></a>
+## Próximas ampliaciones
 
-La siguiente ampliación se centra en el análisis de series temporales y la introducción al aprendizaje automático mediante regresión lineal.
+Las próximas mejoras se centrarán en el análisis de series temporales y la aplicación de aprendizaje automático mediante regresión lineal para estudiar la evolución de la costa.
 
 ### Series temporales y análisis exploratorio
 
@@ -246,7 +246,7 @@ La siguiente ampliación se centra en el análisis de series temporales y la int
 > Estas tareas están pendientes de implementación en los módulos actuales.
 
 <a id="limitaciones"></a>
-##  Alcance y limitaciones
+## Alcance y limitaciones
 
 ### Clasificación y extracción
 
@@ -270,7 +270,7 @@ La siguiente ampliación se centra en el análisis de series temporales y la int
 ---
 
 <a id="equipo"></a>
-##  Equipo
+## Equipo
 
 Proyecto desarrollado por cuatro estudiantes del Grado en Ingeniería de Satélites:
 
@@ -289,7 +289,7 @@ Proyecto desarrollado por cuatro estudiantes del Grado en Ingeniería de Satéli
 ---
 
 <p align="center">
-   Observación de la Tierra · Análisis geoespacial · Evolución costera
+  Observación de la Tierra · Análisis geoespacial · Evolución costera
 </p>
 
 <p align="center">
