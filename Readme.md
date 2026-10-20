@@ -140,7 +140,7 @@ Se selecciona el archivo de referencia de fecha más próxima y se calculan las 
 | Etapa | Archivo | Responsabilidad |
 | :--- | :--- | :--- |
 | Descarga | `descarga_copernicus.py` | Consultar el catálogo y descargar productos. |
-| Procesamiento | `sesion5.py` / `sesion8.py` | Leer bandas, calcular NDWI y generar máscaras. |
+| Procesamiento | `sesion5.py` | Leer bandas, calcular NDWI y generar máscaras. |
 | Extracción | `extract_shorelines.py` | Limpiar máscaras y extraer puntos del borde agua-tierra. |
 | Medición | `calculate_erosion.py` | Generar transectos, calcular distancias y resumirlas por fecha. |
 | Validación | `error_estimator.py` | Comparar una costa estimada con una referencia externa. |
