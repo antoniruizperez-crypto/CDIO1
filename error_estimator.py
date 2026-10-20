@@ -1,163 +1,122 @@
+"""
+Validación: compara la costa estimada de UNA fecha con una referencia externa
+(ground truth) y calcula métricas de error.
+
+Signo: positivo = la costa estimada está mar adentro de la referencia.
+
+Métricas: sesgo (media con signo), MAE, RMSE, desviación típica (RMSE sin el
+sesgo), mediana, P90 de |d| y cobertura (fracción de transectos con medida).
+Los transectos sin cruce NO entran en las métricas; si la cobertura es baja, el
+error real puede ser mayor que el calculado (aumenta --half-length).
+
+Salidas (projects/<p>/output/estimated_error/):
+  shoreline_distances.csv, error_metrics.csv, error_map.png
+"""
+
 import argparse
-import sys
 from datetime import datetime
-from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from scipy.interpolate import splev, splprep
-from shapely.geometry import LineString, MultiPoint, Point
+from matplotlib.collections import LineCollection
 
+import calculate_erosion as ce
+import config
 import shoreline_utils as utils
 
 
-SPATIAL_SPACING = 10
-TRANSECT_LENGTH = 100
+def main(project, ground_truth, date, show_plot=True, spacing=None, half_length=None, sigma=None):
+    spacing = spacing or config.SPATIAL_SPACING
+    half_length = half_length or config.TRANSECT_HALF_LENGTH
+    sigma = config.SPLINE_SMOOTH_M if sigma is None else sigma
 
-
-def closest_ground_truth_file(ground_truth_dir, target_date):
-    base = Path(ground_truth_dir).expanduser().resolve()
-    if not base.is_dir():
-        print(f"Error: {base} is not a directory", file=sys.stderr)
-        sys.exit(1)
-
-    dated_files = []
-    for csv_file in base.glob("*.csv"):
-        date = utils.extract_date(csv_file.name)
-        if date is not None:
-            dated_files.append((date, csv_file))
-
-    if not dated_files:
-        raise FileNotFoundError(f"No dated CSV files found in {base}")
-
-    return min(dated_files, key=lambda row: abs(row[0] - target_date))
-
-
-def signed_intersection_distance(intersection, px, py, normal):
-    if isinstance(intersection, MultiPoint):
-        distances = [Point(px, py).distance(point) for point in intersection.geoms]
-        return distances[int(np.argmin(distances))]
-
-    if isinstance(intersection, Point):
-        signed_vector = np.array([intersection.x - px, intersection.y - py])
-        distance = np.linalg.norm(signed_vector)
-        if np.dot(signed_vector, normal) < 0:
-            distance = -distance
-        return distance
-
-    return np.nan
-
-
-def main(project, ground_truth, date, show_plot=True):
-    target_date = datetime.strptime(date, "%Y-%m-%d").date()
+    target = datetime.strptime(date, "%Y-%m-%d").date()
     project_dir = utils.project_path(project)
+    edges_dir = project_dir / "output" / "estimated_waterbodies_edges"
     output_dir = project_dir / "output" / "estimated_error"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    csv_path = project_dir / "output" / "estimated_waterbodies_edges" / "all_shorelines.csv"
-    df = pd.read_csv(csv_path)
-    shorelines = {date: group[["x", "y"]].values for date, group in df.groupby("date")}
-
+    shorelines = utils.read_shorelines(edges_dir / "all_shorelines.csv")
     if date not in shorelines:
-        raise ValueError(f"Date {date} is not present in {csv_path}")
+        raise ValueError(f"La fecha {date} no está en all_shorelines.csv. Disponibles: {sorted(shorelines)}")
+    crs = ce.load_meta(edges_dir)["crs"]
 
-    reference_date, gt_csv_path = closest_ground_truth_file(ground_truth, target_date)
-    reference_coords = np.loadtxt(gt_csv_path, delimiter="\t", skiprows=1)
-    gt_coords = utils.load_coords_csv(gt_csv_path)
-    utils.export_coords_to_kmz(gt_coords, gt_csv_path.with_suffix(".kmz"))
+    ref_date, ref_segments = ce.reference_from_ground_truth(
+        project_dir, ground_truth, date, shorelines, crs, output_dir
+    )
+    gap_days = abs((datetime.strptime(ref_date, "%Y-%m-%d").date() - target).days)
 
-    x = reference_coords[:, 0]
-    y = reference_coords[:, 1]
-    xy_unique = np.unique(np.column_stack((x, y)), axis=0)
-    x_unique = xy_unique[:, 0]
-    y_unique = xy_unique[:, 1]
+    transects = utils.build_transects(ref_segments, spacing, sigma, half_length)
+    if not transects:
+        raise ValueError("No se pudieron generar transectos con la referencia externa.")
 
-    reference_line = utils.build_ordered_linestring(np.column_stack((x, y)), ordered=True)
-    shoreline_length = reference_line.length
-    n_points = int(shoreline_length / SPATIAL_SPACING)
+    geom = ce.date_geometry(shorelines[date])
+    res = utils.measure_transects(transects, geom)
+    df = pd.DataFrame({
+        "date": date,
+        "transect_id": [t["id"] for t in transects],
+        "ref_segment": [t["segment"] for t in transects],
+        "reference_x": [t["x"] for t in transects],
+        "reference_y": [t["y"] for t in transects],
+        "distance_m": [r[0] for r in res],
+        "n_crossings": [r[1] for r in res],
+    })
+    d = df["distance_m"].dropna().to_numpy()
+    if d.size == 0:
+        raise ValueError("Ningún transecto cruza la costa estimada: revisa fechas, AOI y --half-length.")
 
-    tck, _ = splprep([x_unique, y_unique], s=0)
-    unew = np.linspace(0, 1, num=n_points)
-    x_smooth, y_smooth = splev(unew, tck)
-    dx, dy = splev(unew, tck, der=1)
+    metrics = {
+        "date": date, "reference_date": ref_date, "days_between": gap_days,
+        "valid_samples": int(d.size), "transects": len(transects),
+        "coverage_ratio": d.size / len(transects),
+        "bias_m": float(d.mean()),
+        "mae_m": float(np.abs(d).mean()),
+        "rmse_m": float(np.sqrt((d**2).mean())),
+        "std_m": float(d.std(ddof=1)) if d.size > 1 else float("nan"),
+        "median_m": float(np.median(d)),
+        "p90_abs_m": float(np.percentile(np.abs(d), 90)),
+    }
+    print(f"Referencia: {ref_date} ({gap_days} días de diferencia con {date})")
+    if gap_days > 0:
+        print("  Aviso: parte del error puede ser cambio real de la costa entre ambas fechas.")
+    for k in ("valid_samples", "coverage_ratio", "bias_m", "mae_m", "rmse_m", "std_m", "median_m", "p90_abs_m"):
+        v = metrics[k]
+        print(f"  {k}: {v:.3f}" if isinstance(v, float) else f"  {k}: {v}")
+    if metrics["coverage_ratio"] < 0.9:
+        print("  Aviso: cobertura < 90 %. Las métricas ignoran los transectos sin cruce.")
+
+    df.to_csv(output_dir / "shoreline_distances.csv", index=False)
+    pd.DataFrame([metrics]).to_csv(output_dir / "error_metrics.csv", index=False)
 
     fig, ax = plt.subplots(figsize=(12, 8))
-    x_ref, y_ref = reference_line.xy
-    ax.plot(x_ref, y_ref, "k--", label=f"Reference shoreline ({reference_date})", alpha=0.5)
-    ax.plot(x_smooth, y_smooth, "b", label=f"Smoothed shoreline ({reference_date})", alpha=0.7)
-
-    for i in range(len(unew)):
-        px, py = x_smooth[i], y_smooth[i]
-        tx, ty = dx[i], dy[i]
-        normal = np.array([-ty, tx])
-        normal /= np.linalg.norm(normal)
-        start = (px - normal[0] * TRANSECT_LENGTH / 2, py - normal[1] * TRANSECT_LENGTH / 2)
-        end = (px + normal[0] * TRANSECT_LENGTH / 2, py + normal[1] * TRANSECT_LENGTH / 2)
-        ax.plot([start[0], end[0]], [start[1], end[1]], "g-", alpha=0.3)
-
-    print(f"Ordering shoreline for {date}...")
-    line = utils.build_ordered_linestring(shorelines[date], False)
-    print("Done")
-
-    distance_results = []
-    x_line, y_line = line.xy
-    ax.plot(x_line, y_line, "k--", label=date)
-
-    for i in range(len(unew)):
-        px, py = x_smooth[i], y_smooth[i]
-        tx, ty = dx[i], dy[i]
-        normal = np.array([-ty, tx])
-        normal /= np.linalg.norm(normal)
-        start = (px - normal[0] * TRANSECT_LENGTH / 2, py - normal[1] * TRANSECT_LENGTH / 2)
-        end = (px + normal[0] * TRANSECT_LENGTH / 2, py + normal[1] * TRANSECT_LENGTH / 2)
-        transect = LineString([start, end])
-
-        distance = signed_intersection_distance(transect.intersection(line), px, py, normal)
-        distance_results.append(
-            {
-                "date": date,
-                "transect_id": i,
-                "reference_x": px,
-                "reference_y": py,
-                "distance_m": distance,
-            }
-        )
-
-    distance_df = pd.DataFrame(distance_results)
-    rmse = np.sqrt((distance_df["distance_m"].dropna() ** 2).mean())
-    print(f"RMSE: {rmse}")
-    print(f"Valid samples: {distance_df['distance_m'].notna().sum()}")
-    print(f"Reference date: {reference_date}")
-    distance_df.to_csv(output_dir / "shoreline_distances.csv", index=False)
-
-    ax.set_title("Shoreline Geometry and Transect Intersections")
-    ax.set_xlabel("X (meters, projected)")
-    ax.set_ylabel("Y (meters, projected)")
+    ax.add_collection(LineCollection([list(t["line"].coords) for t in transects],
+                                     colors="green", alpha=0.25, linewidths=0.6))
+    for k, s in enumerate(ref_segments):
+        ax.plot(s[:, 0], s[:, 1], "b", alpha=0.8, label=f"Referencia externa ({ref_date})" if k == 0 else None)
+    for k, s in enumerate(shorelines[date]):
+        ax.plot(s[:, 0], s[:, 1], "r--", label=f"Costa estimada ({date})" if k == 0 else None)
+    ax.set_title(f"Validación: RMSE = {metrics['rmse_m']:.2f} m, sesgo = {metrics['bias_m']:.2f} m")
+    ax.set_xlabel("X (m, proyectado)")
+    ax.set_ylabel("Y (m, proyectado)")
     ax.legend()
-    ax.axis("equal")
-    plt.grid(True)
+    ax.set_aspect("equal", adjustable="datalim")
+    ax.autoscale()
+    ax.grid(True)
+    fig.savefig(output_dir / "error_map.png", dpi=150, bbox_inches="tight")
     if show_plot:
         plt.show()
-    else:
-        plt.close(fig)
+    plt.close(fig)
+    return df, metrics
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Estimate shoreline error against ground truth data.")
-    parser.add_argument(
-        "-p",
-        "--project",
-        required=True,
-        help="Project name under coastline_estimator/projects.",
-    )
-    parser.add_argument(
-        "-g",
-        "--ground-truth",
-        required=True,
-        help="Path to a folder containing ground truth CSV files.",
-    )
-    parser.add_argument("-d", "--date", required=True, help="Date to compare, formatted as YYYY-MM-DD.")
-    parser.add_argument("--no-plot", action="store_true", help="Write CSV outputs without opening plots.")
-    args = parser.parse_args()
-    main(args.project, args.ground_truth, args.date, show_plot=not args.no_plot)
+    parser = argparse.ArgumentParser(description="Error de la costa estimada frente a una referencia externa.")
+    parser.add_argument("-p", "--project", default=config.NOMBRE_PROYECTO)
+    parser.add_argument("-g", "--ground-truth", required=True, help="Carpeta con CSV de referencia (x,y en UTM).")
+    parser.add_argument("-d", "--date", required=True, help="Fecha a comparar, YYYY-MM-DD.")
+    parser.add_argument("--spacing", type=float)
+    parser.add_argument("--half-length", type=float)
+    parser.add_argument("--no-plot", action="store_true")
+    a = parser.parse_args()
+    main(a.project, a.ground_truth, a.date, show_plot=not a.no_plot, spacing=a.spacing, half_length=a.half_length)

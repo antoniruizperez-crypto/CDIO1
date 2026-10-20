@@ -1,255 +1,167 @@
-import argparse
-import pickle
-import sys
-from datetime import datetime
-from pathlib import Path
+"""
+Medición de erosión / acreción respecto a una costa de referencia.
 
-import geopandas as gpd
+1. Se elige la referencia: la primera fecha del dataset, o una costa externa
+   (ground truth) con --ground-truth.
+2. Cada segmento de referencia se remuestrea con una spline de suavizado y se
+   generan transectos perpendiculares cada SPATIAL_SPACING metros.
+3. Para cada fecha se mide dónde cruza su costa cada transecto.
+
+Signo: ver shoreline_utils. Positivo = mar adentro (acreción), negativo = tierra
+adentro (erosión), siempre respecto a la referencia.
+
+Salidas (projects/<p>/output/estimated_erosion_accretion/):
+  shoreline_distances.csv, distances_summary.csv, transects_map.png
+"""
+
+import argparse
+from datetime import datetime
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import rasterio
-from scipy.interpolate import splev, splprep
-from shapely.geometry import LineString, MultiPoint, Point
+from matplotlib.collections import LineCollection
+from shapely.geometry import LineString, MultiLineString
 
+import config
 import shoreline_utils as utils
 
 
-SPATIAL_SPACING = 10
-TRANSECT_LENGTH = 100
+def load_meta(edges_dir):
+    import json
+    with open(edges_dir / "shorelines_meta.json") as f:
+        return json.load(f)
 
 
-def closest_ground_truth_file(ground_truth_dir, target_date):
-    base = Path(ground_truth_dir).expanduser().resolve()
-    if not base.is_dir():
-        print(f"Error: {base} is not a directory", file=sys.stderr)
-        sys.exit(1)
-
-    dated_files = []
-    for csv_file in base.glob("*.csv"):
-        date = utils.extract_date(csv_file.name)
-        if date is not None:
-            dated_files.append((date, csv_file))
-
-    if not dated_files:
-        raise FileNotFoundError(f"No dated CSV files found in {base}")
-
-    return min(dated_files, key=lambda row: abs(row[0] - target_date))
+def reference_from_first_date(shorelines, first_date):
+    segs = [s for s in shorelines[first_date] if LineString(s).length >= config.REF_MIN_SEGMENT_M]
+    if not segs:  # costa muy fragmentada: se usa el segmento más largo
+        segs = [max(shorelines[first_date], key=lambda s: LineString(s).length)]
+    return first_date, utils.order_segments(segs)
 
 
-def load_reference(project_dir, shorelines, sorted_dates_str, ground_truth):
-    if ground_truth is None:
-        reference_date = sorted_dates_str[0]
-        reference_coords = shorelines[reference_date]
-        return reference_date, reference_coords, 1, False
+def reference_from_ground_truth(project_dir, ground_truth, first_date, shorelines, crs, output_dir):
+    target = datetime.strptime(first_date, "%Y-%m-%d").date()
+    ref_date, gt_path = utils.closest_ground_truth_file(ground_truth, target)
+    xy = utils.transform_xy(utils.load_xy_csv(gt_path), config.GT_CRS, crs)
 
-    first_date = datetime.strptime(sorted_dates_str[0], "%Y-%m-%d").date()
-    reference_date, gt_csv_path = closest_ground_truth_file(ground_truth, first_date)
-    reference_coords = np.loadtxt(gt_csv_path, delimiter="\t", skiprows=1)
+    ll = utils.transform_xy(xy, crs, 4326)
+    utils.export_lines_to_kmz([list(map(tuple, ll))], output_dir / f"{gt_path.stem}_reference.kmz")
 
-    gt_coords = utils.load_coords_csv(gt_csv_path)
-    utils.export_coords_to_kmz(gt_coords, gt_csv_path.with_suffix(".kmz"))
+    aoi = utils.load_project_aoi(project_dir, crs)
+    parts = utils.flatten_lines(LineString(utils.dedupe_consecutive(xy)).intersection(aoi))
+    parts = [p for p in parts if p.length >= config.REF_MIN_SEGMENT_M]
+    if not parts:
+        raise ValueError("La referencia externa no tiene tramos útiles dentro del AOI.")
 
-    return reference_date.isoformat(), reference_coords, 0, True
-
-
-def signed_intersection_distance(intersection, px, py, normal):
-    if isinstance(intersection, MultiPoint):
-        distances = [Point(px, py).distance(point) for point in intersection.geoms]
-        return distances[int(np.argmin(distances))]
-
-    if isinstance(intersection, Point):
-        signed_vector = np.array([intersection.x - px, intersection.y - py])
-        distance = np.linalg.norm(signed_vector)
-        if np.dot(signed_vector, normal) < 0:
-            distance = -distance
-        return distance
-
-    return np.nan
+    est_lines = [LineString(s) for s in shorelines[first_date]]
+    segs = [utils.orient_like(np.asarray(p.coords)[:, :2], est_lines) for p in parts]
+    return ref_date.isoformat(), utils.order_segments(segs)
 
 
-def load_project_aoi(project_dir):
-    geojson_path = project_dir / "input" / "polygon.geojson"
-    mask_dir = project_dir / "output" / "estimated_waterbodies_images"
-    first_mask = next(mask_dir.glob("*.tif"), None)
-    if first_mask is None or not geojson_path.exists():
-        return None
-
-    aoi = gpd.read_file(geojson_path).set_crs(4326, allow_override=True)
-    with rasterio.open(first_mask) as src:
-        return aoi.to_crs(src.crs)
+def date_geometry(segments):
+    return MultiLineString([s for s in segments if len(s) >= 2])
 
 
-def main(project, ground_truth=None, show_plot=True):
+def plot_map(ref_segments, transects, shorelines, dates, ref_label, out_png, show):
+    fig, ax = plt.subplots(figsize=(12, 8))
+    ax.add_collection(LineCollection([list(t["line"].coords) for t in transects],
+                                     colors="green", alpha=0.25, linewidths=0.6))
+    for k, s in enumerate(ref_segments):
+        ax.plot(s[:, 0], s[:, 1], "k--", alpha=0.6, label=f"Referencia ({ref_label})" if k == 0 else None)
+    cmap = plt.cm.tab10.colors
+    for i, d in enumerate(dates):
+        for k, s in enumerate(shorelines[d]):
+            ax.plot(s[:, 0], s[:, 1], "--", color=cmap[i % 10], lw=1, label=d if k == 0 else None)
+    ax.set_title("Referencia, transectos (verde) y costas por fecha")
+    ax.set_xlabel("X (m, proyectado)")
+    ax.set_ylabel("Y (m, proyectado)")
+    ax.legend(fontsize=7, ncol=2)
+    ax.set_aspect("equal", adjustable="datalim")
+    ax.autoscale()
+    ax.grid(True)
+    fig.savefig(out_png, dpi=150, bbox_inches="tight")
+    if show:
+        plt.show()
+    plt.close(fig)
+
+
+def main(project, ground_truth=None, show_plot=True, spacing=None, half_length=None, sigma=None):
+    spacing = spacing or config.SPATIAL_SPACING
+    half_length = half_length or config.TRANSECT_HALF_LENGTH
+    sigma = config.SPLINE_SMOOTH_M if sigma is None else sigma
+
     project_dir = utils.project_path(project)
+    edges_dir = project_dir / "output" / "estimated_waterbodies_edges"
     output_dir = project_dir / "output" / "estimated_erosion_accretion"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    csv_path = project_dir / "output" / "estimated_waterbodies_edges" / "all_shorelines.csv"
-    df = pd.read_csv(csv_path)
+    shorelines = utils.read_shorelines(edges_dir / "all_shorelines.csv")
+    crs = load_meta(edges_dir)["crs"]
+    dates = sorted(shorelines)
 
-    shorelines = {date: group[["x", "y"]].values for date, group in df.groupby("date")}
-    sorted_dates_str = sorted(shorelines.keys())
-
-    reference_date, reference_coords, start_index, ordered = load_reference(
-        project_dir, shorelines, sorted_dates_str, ground_truth
-    )
-
-    x = reference_coords[:, 0]
-    y = reference_coords[:, 1]
-    xy_unique = np.unique(np.column_stack((x, y)), axis=0)
-    x_unique = xy_unique[:, 0]
-    y_unique = xy_unique[:, 1]
-
-    reference_date_underscores = str(reference_date).replace("-", "_")
-    line_path = output_dir / f"ref_{reference_date_underscores}.pkl"
-    if line_path.exists() and line_path.stat().st_size > 0:
-        with open(line_path, "rb") as f:
-            reference_line = pickle.load(f)
+    if ground_truth is None:
+        ref_label, ref_segments = reference_from_first_date(shorelines, dates[0])
     else:
-        reference_line = utils.build_ordered_linestring(np.column_stack((x, y)), ordered)
-        if ground_truth is not None:
-            aoi = load_project_aoi(project_dir)
-            if aoi is not None:
-                reference_line = reference_line.intersection(aoi.unary_union)
-        with open(line_path, "wb") as f:
-            pickle.dump(reference_line, f)
+        ref_label, ref_segments = reference_from_ground_truth(
+            project_dir, ground_truth, dates[0], shorelines, crs, output_dir
+        )
 
-    shoreline_length = reference_line.length
-    n_points = int(shoreline_length / SPATIAL_SPACING)
+    transects = utils.build_transects(ref_segments, spacing, sigma, half_length)
+    if not transects:
+        raise ValueError("No se pudieron generar transectos con la referencia elegida.")
+    print(f"Referencia: {ref_label} | segmentos: {len(ref_segments)} | transectos: {len(transects)}")
+    print(f"Espaciado medio entre transectos: {utils.mean_transect_spacing(transects):.2f} m")
 
-    tck, _ = splprep([x_unique, y_unique], s=0)
-    unew = np.linspace(0, 1, num=n_points)
-    x_smooth, y_smooth = splev(unew, tck)
-    dx, dy = splev(unew, tck, der=1)
-
-    fig, ax = plt.subplots(figsize=(12, 8))
-    x_ref, y_ref = reference_line.xy
-    ax.plot(x_ref, y_ref, "k--", label=f"Reference shoreline ({reference_date})", alpha=0.5)
-    ax.plot(x_smooth, y_smooth, "b", label=f"Smoothed shoreline ({reference_date})", alpha=0.7)
-
-    for i in range(len(unew)):
-        px, py = x_smooth[i], y_smooth[i]
-        tx, ty = dx[i], dy[i]
-        normal = np.array([-ty, tx])
-        normal /= np.linalg.norm(normal)
-        start = (px - normal[0] * TRANSECT_LENGTH / 2, py - normal[1] * TRANSECT_LENGTH / 2)
-        end = (px + normal[0] * TRANSECT_LENGTH / 2, py + normal[1] * TRANSECT_LENGTH / 2)
-        ax.plot([start[0], end[0]], [start[1], end[1]], "g-", alpha=0.3)
-
-    distance_results = []
-    colors = ["r", "m", "c", "y"]
-    dist_reference = 0
-
-    for idx, date in enumerate(sorted_dates_str[start_index:]):
-        coords = shorelines[date]
-        if len(coords) < 2:
-            print(f"Skipping shoreline for {date} due to insufficient points.")
-            continue
-
-        print(f"Ordering shoreline for {date}...")
-        date_underscores = date.replace("-", "_")
-        line_cache_path = output_dir / f"line_{date_underscores}.pkl"
-        if line_cache_path.exists() and line_cache_path.stat().st_size > 0:
-            with open(line_cache_path, "rb") as f:
-                line = pickle.load(f)
-        else:
-            line = utils.build_ordered_linestring(coords, False)
-            with open(line_cache_path, "wb") as f:
-                pickle.dump(line, f)
-        print("Done")
-
-        for i in range(len(unew)):
-            px, py = x_smooth[i], y_smooth[i]
-            if i > 0:
-                dist_reference += np.sqrt((px - x_smooth[i - 1]) ** 2 + (py - y_smooth[i - 1]) ** 2)
-
-            x_line, y_line = line.xy
-            ax.plot(
-                x_line,
-                y_line,
-                "--",
-                label=date if i == 0 else None,
-                color=colors[idx % len(colors)],
-            )
-
-            tx, ty = dx[i], dy[i]
-            normal = np.array([-ty, tx])
-            normal /= np.linalg.norm(normal)
-            start = (px - normal[0] * TRANSECT_LENGTH / 2, py - normal[1] * TRANSECT_LENGTH / 2)
-            end = (px + normal[0] * TRANSECT_LENGTH / 2, py + normal[1] * TRANSECT_LENGTH / 2)
-            transect = LineString([start, end])
-
-            distance = signed_intersection_distance(transect.intersection(line), px, py, normal)
-            distance_results.append(
-                {
-                    "date": date,
-                    "transect_id": i,
-                    "reference_x": px,
-                    "reference_y": py,
-                    "distance_m": distance,
-                }
-            )
-
-    if distance_results:
-        print(f"Average distance between transects: {dist_reference / max(1, len(unew) - 1):.2f} meters")
-
-    distance_df = pd.DataFrame(distance_results)
-    total_transects = distance_df["transect_id"].nunique()
-
-    print(f"Number of transects computed: {len(unew)}")
-    print(
-        "Number of valid transects with at least one valid distance: "
-        f"{distance_df.loc[distance_df['distance_m'].notna(), 'transect_id'].nunique()}"
-    )
-    print(f"First date in dataset: {distance_df['date'].min()}")
-    print(f"Last date in dataset: {distance_df['date'].max()}")
-    print(f"Number of distinct dates in dataset: {distance_df['date'].nunique()}")
+    rows = []
+    for d in dates:
+        geom = date_geometry(shorelines[d])
+        for t, (dist, ncross) in zip(transects, utils.measure_transects(transects, geom)):
+            rows.append({"date": d, "transect_id": t["id"], "ref_segment": t["segment"],
+                         "reference_x": t["x"], "reference_y": t["y"],
+                         "distance_m": dist, "n_crossings": ncross})
+    distance_df = pd.DataFrame(rows)
+    total = len(transects)
 
     summary_df = (
         distance_df.groupby("date")
-        .agg(
-            avg_distance_m=("distance_m", "mean"),
-            median_distance_m=("distance_m", "median"),
-            std_distance_m=("distance_m", "std"),
-            max_distance_m=("distance_m", "max"),
-            min_distance_m=("distance_m", "min"),
-            valid_points=("distance_m", lambda values: values.notna().sum()),
-        )
+        .agg(avg_distance_m=("distance_m", "mean"),
+             median_distance_m=("distance_m", "median"),
+             std_distance_m=("distance_m", "std"),
+             max_distance_m=("distance_m", "max"),
+             min_distance_m=("distance_m", "min"),
+             valid_points=("distance_m", lambda v: int(v.notna().sum())),
+             multi_crossing_points=("n_crossings", lambda v: int((v > 1).sum())))
         .reset_index()
     )
-
-    summary_df["coverage_ratio"] = summary_df["valid_points"] / total_transects
+    summary_df["coverage_ratio"] = summary_df["valid_points"] / total
     summary_df["range_distance_m"] = summary_df["max_distance_m"] - summary_df["min_distance_m"]
 
-    summary_df.to_csv(output_dir / "distances_summary.csv", index=False)
-    distance_df.to_csv(output_dir / "shoreline_distances.csv", index=False)
+    params_path = edges_dir / "extraction_params.csv"
+    if params_path.exists():
+        p = pd.read_csv(params_path)[["date", "ndwi_threshold", "cloud_pct_aoi"]]
+        p["date"] = p["date"].astype(str)
+        summary_df = summary_df.merge(p, on="date", how="left")
 
-    ax.set_title("Shoreline Geometry and Transect Intersections")
-    ax.set_xlabel("X (meters, projected)")
-    ax.set_ylabel("Y (meters, projected)")
-    ax.legend()
-    ax.axis("equal")
-    plt.grid(True)
-    if show_plot:
-        plt.show()
-    else:
-        plt.close(fig)
+    distance_df.to_csv(output_dir / "shoreline_distances.csv", index=False)
+    summary_df.to_csv(output_dir / "distances_summary.csv", index=False)
+
+    print(f"Fechas: {len(dates)} ({dates[0]} -> {dates[-1]})")
+    print(f"Transectos con al menos una medida válida: "
+          f"{distance_df.loc[distance_df['distance_m'].notna(), 'transect_id'].nunique()} de {total}")
+    print(summary_df[["date", "avg_distance_m", "std_distance_m", "coverage_ratio"]].to_string(index=False))
+
+    plot_map(ref_segments, transects, shorelines, dates, ref_label,
+             output_dir / "transects_map.png", show_plot)
+    return distance_df, summary_df
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Estimate erosion and accretion from shoreline data.")
-    parser.add_argument(
-        "-p",
-        "--project",
-        required=True,
-        help="Project name under coastline_estimator/projects.",
-    )
-    parser.add_argument(
-        "-g",
-        "--ground-truth",
-        help="Path to a folder containing ground truth CSV files to use as a reference.",
-    )
-    parser.add_argument("--no-plot", action="store_true", help="Write CSV outputs without opening plots.")
-    args = parser.parse_args()
-    main(args.project, args.ground_truth, show_plot=not args.no_plot)
+    parser = argparse.ArgumentParser(description="Estima erosión y acreción respecto a una referencia.")
+    parser.add_argument("-p", "--project", default=config.NOMBRE_PROYECTO)
+    parser.add_argument("-g", "--ground-truth", help="Carpeta con CSV de referencia externa (x,y en UTM).")
+    parser.add_argument("--spacing", type=float, help="Separación entre transectos (m).")
+    parser.add_argument("--half-length", type=float, help="Longitud del transecto a cada lado (m).")
+    parser.add_argument("--no-plot", action="store_true", help="No abrir ventanas (el PNG se guarda igual).")
+    a = parser.parse_args()
+    main(a.project, a.ground_truth, show_plot=not a.no_plot, spacing=a.spacing, half_length=a.half_length)

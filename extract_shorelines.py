@@ -1,257 +1,347 @@
+"""
+Extracción de la línea de costa con resolución SUBPÍXEL.
+
+En vez de marcar los píxeles de agua que tocan tierra (error sistemático de
+~5 m y puntos desordenados), se calcula el contorno del NDWI continuo en el
+nivel del umbral (marching squares). El resultado:
+  - posición interpolada dentro del píxel (precisión de pocos metros),
+  - polilíneas ya ORDENADAS (no hace falta reconstruir la costa por vecino
+    más cercano ni se unen tramos separados),
+  - cada segmento orientado con el agua a la izquierda (ver shoreline_utils).
+
+Limpieza de ruido: se eliminan manchas pequeñas de agua EN tierra y de tierra
+EN agua por ÁREA (no por morfología), de modo que no se borran espigones
+estrechos pero largos. El closing clásico es opcional (--closing-radius).
+
+Entrada : projects/<p>/output/estimated_ndwi/*.tif   (los genera sesion5.py)
+Salida  : projects/<p>/output/estimated_waterbodies_edges/
+            all_shorelines.csv, extraction_params.csv, shorelines_meta.json,
+            <escena>.kmz/.csv/_xyz.csv/.geojson
+          projects/<p>/output/estimated_waterbodies_images_clean/<escena>_clean.tif
+"""
+
 import argparse
 import json
-import os
 from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
+import pandas as pd
 import rasterio
 from pyproj import Transformer
 from rasterio.features import geometry_mask
-from scipy.ndimage import binary_erosion, convolve
+from scipy import ndimage as ndi
+from shapely.geometry import LineString
+from skimage.measure import find_contours
 from skimage.morphology import closing, disk
 from tqdm import tqdm
 
+import config
 import shoreline_utils as utils
 
-# Radio (en píxeles, 1 px = 10 m) del disco usado en el "closing" morfológico.
-# El closing rellena manchas de tierra (0) dentro del agua (1): radio 1 rellena
-# huecos de hasta ~2 px de ancho (~20 m), radio 2 hasta ~4 px (~40 m).
-# 0 desactiva la limpieza.
-CLOSING_RADIUS = 1
 
-# True  -> guarda las máscaras limpias (tras el closing) como GeoTIFF en clean_dir.
-# False -> no guarda nada (ni crea la carpeta); el closing se aplica igualmente
-#          en memoria para calcular los bordes.
-SAVE_CLEAN_MASKS = True
+# ---------------------------------------------------------------------------
+# Limpieza de la máscara
+# ---------------------------------------------------------------------------
 
-
-def reproject_coords_to_latlon(coords, src_crs):
-    transformer = Transformer.from_crs(src_crs, "EPSG:4326", always_xy=True)
-    return [transformer.transform(x, y) for x, y in coords]
-
-
-def export_coords_to_csv_latlon(coords, output_csv_path, date):
-    with open(output_csv_path, "w") as f:
-        for lon, lat in coords:
-            f.write(f"{lat},{lon},{date}\n")
-
-
-def export_coords_to_csv_xy(coords, output_csv_path, date):
-    with open(output_csv_path, "w") as f:
-        for x, y in coords:
-            f.write(f"{x},{y},{date}\n")
-
-
-def extract_date_from_mask(mask_path):
-    date = utils.extract_date(mask_path.name)
-    if date is None:
-        raise ValueError(
-            f"Could not extract an YYYYMMDD date from mask filename: {mask_path.name}"
-        )
-    return date.isoformat()
-
-
-def read_mask_band(src):
-    if src.count != 1:
-        raise ValueError(f"Expected a single-band mask GeoTIFF, got {src.count} bands: {src.name}")
-    return src.read()[0]
-
-
-def denoise_mask(mask_image, radius=CLOSING_RADIUS):
-    """
-    Rellena las manchas de tierra (0) dentro del agua (1) con un "closing"
-    morfológico: dilatación + erosión, ambas con un disco de 'radio' px.
-
-    - La dilatación tapa los huecos de tierra más pequeños que el disco.
-    - La erosión posterior devuelve a su tamaño original el agua, así que la
-      costa real no se desplaza.
-    - Un closing solo puede añadir píxeles de agua, nunca quitarlos.
-    """
-    binary = (mask_image > 0).astype(np.uint8)
-    if radius <= 0:
+def drop_small_components(binary, min_px, protected):
+    """Elimina componentes True con menos de min_px píxeles, salvo las que tocan 'protected'."""
+    if min_px <= 1 or not binary.any():
         return binary
-    return closing(binary, disk(radius)).astype(np.uint8)
+    lab, n = ndi.label(binary, structure=np.ones((3, 3), bool))
+    sizes = np.bincount(lab.ravel(), minlength=n + 1)
+    remove = sizes < min_px
+    remove[0] = False
+    keep_ids = np.unique(lab[protected & (lab > 0)])
+    remove[keep_ids] = False
+    return binary & ~remove[lab]
 
 
-def save_mask_tif(mask, output_path, src_profile):
-    """Guarda la máscara limpia como GeoTIFF uint8 (0 = tierra, 1 = agua), georreferenciada."""
-    profile = src_profile.copy()
-    profile.update(driver="GTiff", dtype=rasterio.uint8, count=1, nodata=None)
-    with rasterio.open(output_path, "w", **profile) as dst:
-        dst.write(mask.astype(np.uint8), 1)
+def clean_water_mask(ndwi, thr, valid, min_area_px, closing_radius):
+    """Devuelve (agua_cruda, agua_limpia) como arrays booleanos."""
+    ndwi_f = np.where(valid, ndwi, -9.0)
+    water_raw = valid & (ndwi_f > thr)
+    water = water_raw.copy()
+    if closing_radius > 0:
+        water = closing(water, disk(closing_radius)) & valid
+
+    # Los componentes que tocan el borde del recorte o píxeles inválidos pueden
+    # ser trozos de algo grande: no se tocan.
+    protected = np.zeros(valid.shape, bool)
+    protected[0, :] = protected[-1, :] = protected[:, 0] = protected[:, -1] = True
+    protected |= ndi.binary_dilation(~valid, iterations=1)
+
+    water = drop_small_components(water, min_area_px, protected)      # agua suelta en tierra
+    land = drop_small_components(valid & ~water, min_area_px, protected)  # tierra suelta en agua
+    water_clean = valid & ~land
+    return water_raw, water_clean
 
 
-def estimate_mask_edges(mask_file, aoi_proj, aoi_gdf, output_dir, clean_dir, closing_radius=CLOSING_RADIUS):
-    with rasterio.open(mask_file) as src:
-        raw_mask = read_mask_band(src)
+def adjust_ndwi(ndwi, thr, water_raw, water_clean, margin):
+    """NDWI corregido: los píxeles cuya clase cambió pasan al lado correcto del umbral."""
+    adj = ndwi.copy()
+    adj[water_clean & ~water_raw] = thr + margin
+    adj[~water_clean & water_raw] = thr - margin
+    return adj
 
-        # Denoising: closing sobre la máscara antes de calcular los bordes
-        mask_image = denoise_mask(raw_mask, closing_radius)
 
-        # Se guarda la máscara limpia en una carpeta APARTE de la de entrada
-        # (si estuviera en mask_dir, se volvería a procesar como una máscara más).
-        if SAVE_CLEAN_MASKS:
-            save_mask_tif(mask_image, clean_dir / f"{mask_file.stem}_closed.tif", src.profile)
+# ---------------------------------------------------------------------------
+# Contornos
+# ---------------------------------------------------------------------------
 
-        aoi_mask = geometry_mask(
-            [geom for geom in aoi_proj.geometry],
-            transform=src.transform,
-            invert=True,
-            out_shape=mask_image.shape,
-        )
+def contour_to_xy(contour, transform):
+    """(fila, col) subpíxel de find_contours -> coordenadas del mapa (centro de píxel = índice entero)."""
+    rows, cols = contour[:, 0] + 0.5, contour[:, 1] + 0.5
+    x = transform.c + transform.a * cols + transform.b * rows
+    y = transform.f + transform.d * cols + transform.e * rows
+    return np.column_stack([x, y])
 
-        kernel = np.array(
-            [
-                [1, 1, 1],
-                [1, 0, 1],
-                [1, 1, 1],
-            ]
-        )
 
-        neighbor_sum = convolve(mask_image.astype(np.uint8), kernel, mode="constant", cval=0)
-        transition_mask = np.logical_and(mask_image, neighbor_sum < 8)
-        eroded_aoi_mask = binary_erosion(aoi_mask, structure=kernel)
-        final_coast_mask = np.logical_and(transition_mask, eroded_aoi_mask)
+def orient_water_left(coords, state, transform, offset_m, max_samples=25):
+    """
+    Devuelve (coords, ambiguo). Orienta el segmento para que el agua quede a la
+    izquierda, muestreando la máscara limpia a ambos lados (voto por mayoría).
+    state: 1 agua, 0 tierra, -1 inválido.
+    """
+    n = len(coords)
+    if n < 5:
+        return coords, True
+    inv = ~transform
+    h, w = state.shape
+    idx = np.unique(np.linspace(1, n - 2, min(max_samples, n - 2)).astype(int))
+    score = 0
 
-        rows, cols = np.nonzero(final_coast_mask)
-        xs, ys = rasterio.transform.xy(src.transform, rows, cols)
-        coords_xy = list(zip(xs, ys))
+    def sample(p):
+        col = inv.a * p[0] + inv.b * p[1] + inv.c
+        row = inv.d * p[0] + inv.e * p[1] + inv.f
+        r, c = int(np.floor(row)), int(np.floor(col))
+        return int(state[r, c]) if (0 <= r < h and 0 <= c < w) else -1
 
-        if len(coords_xy) < 2:
-            print(f"No coastline found in {mask_file}.")
-            return False
+    for i in idx:
+        t = coords[min(i + 2, n - 1)] - coords[max(i - 2, 0)]
+        norm = np.hypot(*t)
+        if norm == 0:
+            continue
+        nrm = np.array([-t[1], t[0]]) / norm
+        left, right = sample(coords[i] + offset_m * nrm), sample(coords[i] - offset_m * nrm)
+        if left == 1 and right == 0:
+            score += 1
+        elif left == 0 and right == 1:
+            score -= 1
+    if score < 0:
+        return np.ascontiguousarray(coords[::-1]), False
+    return coords, score == 0
 
-        coords_latlon = reproject_coords_to_latlon(coords_xy, src.crs)
 
-    date = extract_date_from_mask(mask_file)
-    stem = mask_file.stem
+# ---------------------------------------------------------------------------
+# Procesado de una escena
+# ---------------------------------------------------------------------------
 
-    kmz_path = output_dir / f"{stem}.kmz"
-    utils.export_coords_to_kmz(coords_latlon, kmz_path)
+def scene_stem(path):
+    stem = Path(path).stem
+    return stem[:-5] if stem.endswith("_ndwi") else stem
 
-    csv_latlon_path = output_dir / f"{stem}.csv"
-    export_coords_to_csv_latlon(coords_latlon, csv_latlon_path, date)
 
-    csv_xy_path = output_dir / f"{stem}_xyz.csv"
-    export_coords_to_csv_xy(coords_xy, csv_xy_path, date)
+def save_mask_tif(state, output_path, profile):
+    """Máscara limpia: 0 tierra, 1 agua, 255 inválido."""
+    p = profile.copy()
+    p.update(driver="GTiff", dtype=rasterio.uint8, count=1, nodata=255)
+    out = np.where(state < 0, 255, state).astype(np.uint8)
+    with rasterio.open(output_path, "w", **p) as dst:
+        dst.write(out, 1)
 
-    geojson_path = output_dir / f"{stem}.geojson"
-    geojson_data = {
-        "type": "FeatureCollection",
-        "features": [
-            *[
-                {
-                    "type": "Feature",
-                    "geometry": {"type": "Point", "coordinates": coord},
-                    "properties": {"date": date},
-                }
-                for coord in coords_latlon
-            ],
-            {
-                "type": "Feature",
-                "geometry": aoi_gdf.geometry[0].__geo_interface__,
-                "properties": {"name": "AOI"},
-            },
-        ],
+
+def extract_scene(ndwi_file, aoi_gdf, clean_dir, params):
+    with rasterio.open(ndwi_file) as src:
+        ndwi = src.read(1).astype(np.float32)
+        transform, crs, profile, tags = src.transform, src.crs, src.profile, src.tags()
+
+    aoi_proj = aoi_gdf.to_crs(crs)
+    aoi_poly = aoi_proj.union_all() if hasattr(aoi_proj, "union_all") else aoi_proj.unary_union
+    valid = np.isfinite(ndwi)
+    aoi_mask = geometry_mask(list(aoi_proj.geometry), transform=transform, invert=True, out_shape=ndwi.shape)
+
+    thr, method = utils.compute_ndwi_threshold(
+        ndwi[aoi_mask & valid], params["threshold_mode"], params["threshold_fixed"]
+    )
+    water_raw, water_clean = clean_water_mask(
+        ndwi, thr, valid, params["min_area_px"], params["closing_radius"]
+    )
+    adj = adjust_ndwi(ndwi, thr, water_raw, water_clean, config.FLIP_MARGIN)
+    work = np.where(valid, adj, np.nan)
+    state = np.where(valid, water_clean.astype(np.int8), -1).astype(np.int8)
+
+    if params["save_clean"]:
+        save_mask_tif(state, clean_dir / f"{scene_stem(ndwi_file)}_clean.tif", profile)
+
+    pixel = abs(transform.a)
+    segments, ambiguous = [], 0
+    for c in find_contours(work, level=thr, mask=valid):
+        if len(c) < 3:
+            continue
+        xy = contour_to_xy(c, transform)
+        for part in utils.flatten_lines(LineString(xy).intersection(aoi_poly)):
+            if part.length < params["min_length_m"]:
+                continue
+            coords, amb = orient_water_left(
+                utils.dedupe_consecutive(np.asarray(part.coords)), state, transform, 1.5 * pixel
+            )
+            ambiguous += int(amb)
+            segments.append(coords)
+    segments.sort(key=lambda s: -LineString(s).length)
+
+    n_aoi = max(int(aoi_mask.sum()), 1)
+    info = {
+        "ndwi_threshold": round(thr, 4),
+        "threshold_method": method,
+        "water_fraction_aoi": round(float((water_clean & aoi_mask).sum()) / n_aoi, 4),
+        "pixels_changed_by_cleaning": int((water_raw != water_clean).sum()),
+        "n_segments": len(segments),
+        "total_length_m": round(float(sum(LineString(s).length for s in segments)), 1),
+        "ambiguous_orientation": ambiguous,
+        "cloud_pct_aoi": tags.get("CLOUD_PCT_AOI", ""),
     }
-    with open(geojson_path, "w") as f:
-        json.dump(geojson_data, f, indent=2)
-
-    return True
+    return segments, crs, transform, info
 
 
-def merge_edge_csvs(output_dir):
-    all_edges_csv_path = output_dir / "all_shorelines.csv"
-    edge_files = [
-        output_dir / filename
-        for filename in os.listdir(output_dir)
-        if filename.endswith("_xyz.csv")
+def write_scene_outputs(stem, date, segments, crs, aoi_gdf, output_dir):
+    """Escribe KMZ, CSV lat/lon, CSV x/y y GeoJSON de una escena. Devuelve el DataFrame x/y."""
+    tr = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+    lines_ll = []
+    for s in segments:
+        lon, lat = tr.transform(s[:, 0], s[:, 1])
+        lines_ll.append(list(zip(lon, lat)))
+
+    utils.export_lines_to_kmz(lines_ll, output_dir / f"{stem}.kmz")
+
+    with open(output_dir / f"{stem}.csv", "w") as f:
+        f.write("lat,lon,date,segment\n")
+        for k, line in enumerate(lines_ll):
+            for lon, lat in line:
+                f.write(f"{lat},{lon},{date},{k}\n")
+
+    rows = []
+    for k, s in enumerate(segments):
+        rows.append(
+            pd.DataFrame({"x": s[:, 0], "y": s[:, 1], "date": date, "segment": k,
+                          "order": np.arange(len(s)), "scene": stem})
+        )
+    df = pd.concat(rows, ignore_index=True)
+    df.to_csv(output_dir / f"{stem}_xyz.csv", index=False)
+
+    features = [
+        {"type": "Feature", "properties": {"date": date, "segment": k},
+         "geometry": {"type": "LineString", "coordinates": [list(p) for p in line]}}
+        for k, line in enumerate(lines_ll)
     ]
-
-    with open(all_edges_csv_path, "w") as out:
-        out.write("x,y,date\n")
-        for edge_file in edge_files:
-            with open(edge_file) as f:
-                out.writelines(f.readlines())
-
-    return all_edges_csv_path
+    features.append({"type": "Feature", "properties": {"name": "AOI"},
+                     "geometry": aoi_gdf.geometry.iloc[0].__geo_interface__})
+    with open(output_dir / f"{stem}.geojson", "w") as f:
+        json.dump({"type": "FeatureCollection", "features": features}, f)
+    return df
 
 
-def main(project, mask_dir=None, polygon_path=None, clean_dir=None, closing_radius=CLOSING_RADIUS):
+def choose_scenes(ndwi_files):
+    """Una escena por fecha: si hay varias (teselas solapadas) se queda la de menos nubes."""
+    by_date = {}
+    for f in ndwi_files:
+        d = utils.extract_date(f.name)
+        if d is None:
+            raise ValueError(f"No se pudo extraer la fecha (YYYYMMDD) de: {f.name}")
+        by_date.setdefault(d.isoformat(), []).append(f)
+
+    chosen, skipped = {}, []
+    for d, files in by_date.items():
+        def cloud(path):
+            with rasterio.open(path) as s:
+                return float(s.tags().get("CLOUD_PCT_AOI", 100))
+        best = min(files, key=cloud)
+        chosen[d] = best
+        skipped.extend(f.name for f in files if f != best)
+    return chosen, skipped
+
+
+def main(project, ndwi_dir=None, polygon_path=None, clean_dir=None, threshold_mode=None,
+         threshold_fixed=None, min_area_px=None, min_length_m=None, closing_radius=None):
     project_dir = utils.project_path(project)
-    input_dir = project_dir / "input"
     output_dir = project_dir / "output" / "estimated_waterbodies_edges"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    mask_dir = Path(mask_dir) if mask_dir else project_dir / "output" / "estimated_waterbodies_images"
-    polygon_path = Path(polygon_path) if polygon_path else input_dir / "polygon.geojson"
-    clean_dir = Path(clean_dir) if clean_dir else project_dir / "output" / "estimated_waterbodies_images_closed"
-    if SAVE_CLEAN_MASKS:
+    ndwi_dir = Path(ndwi_dir) if ndwi_dir else project_dir / "output" / "estimated_ndwi"
+    polygon_path = Path(polygon_path) if polygon_path else project_dir / "input" / "polygon.geojson"
+    clean_dir = Path(clean_dir) if clean_dir else project_dir / "output" / "estimated_waterbodies_images_clean"
+
+    params = {
+        "threshold_mode": threshold_mode or config.MODO_UMBRAL,
+        "threshold_fixed": config.UMBRAL_NDWI_FIJO if threshold_fixed is None else threshold_fixed,
+        "min_area_px": config.MIN_AREA_PX if min_area_px is None else min_area_px,
+        "min_length_m": config.MIN_SEGMENT_LENGTH_M if min_length_m is None else min_length_m,
+        "closing_radius": config.CLOSING_RADIUS if closing_radius is None else closing_radius,
+        "save_clean": config.SAVE_CLEAN_MASKS,
+    }
+    if params["save_clean"]:
         clean_dir.mkdir(parents=True, exist_ok=True)
 
-    if not mask_dir.is_dir():
-        raise FileNotFoundError(f"Mask directory does not exist: {mask_dir}")
+    if not ndwi_dir.is_dir():
+        raise FileNotFoundError(f"No existe la carpeta de NDWI: {ndwi_dir} (ejecuta sesion5.py antes)")
     if not polygon_path.is_file():
-        raise FileNotFoundError(f"AOI polygon does not exist: {polygon_path}")
-
-    mask_files = sorted(mask_dir.glob("*.tif"))
-    if not mask_files:
-        raise FileNotFoundError(f"No .tif mask files found in {mask_dir}")
+        raise FileNotFoundError(f"No existe el polígono del AOI: {polygon_path}")
+    ndwi_files = sorted(ndwi_dir.glob("*.tif"))
+    if not ndwi_files:
+        raise FileNotFoundError(f"No hay .tif de NDWI en {ndwi_dir}")
 
     aoi_gdf = gpd.read_file(polygon_path).set_crs(4326, allow_override=True)
-    with rasterio.open(mask_files[0]) as src:
-        raster_crs = src.crs
-    aoi_proj = aoi_gdf.to_crs(raster_crs)
+    chosen, skipped = choose_scenes(ndwi_files)
 
-    # Se procesan TODAS las máscaras de mask_dir en cada ejecución: no se salta
-    # ninguna aunque ya tenga resultados de una ejecución anterior (se
-    # sobrescriben).
-    processed = 0
-    no_coast = []
-    for mask_file in tqdm(mask_files, desc="Extracting shoreline edges"):
-        if estimate_mask_edges(mask_file, aoi_proj, aoi_gdf, output_dir, clean_dir, closing_radius):
-            processed += 1
-        else:
-            no_coast.append(mask_file.name)
+    # Se borran resultados de ejecuciones anteriores para no mezclarlos
+    for old in output_dir.glob("*_xyz.csv"):
+        old.unlink()
 
-    all_edges_csv_path = merge_edge_csvs(output_dir)
-    print(f"Processed {processed} of {len(mask_files)} mask files.")
+    frames, infos, no_coast, crs_used = [], [], [], None
+    for date, ndwi_file in tqdm(sorted(chosen.items()), desc="Extrayendo costas"):
+        segments, crs, _, info = extract_scene(ndwi_file, aoi_gdf, clean_dir, params)
+        if crs_used is not None and crs != crs_used:
+            raise ValueError(f"CRS distinto en {ndwi_file.name}: {crs} != {crs_used}")
+        crs_used = crs
+        stem = scene_stem(ndwi_file)
+        info.update({"date": date, "scene": stem})
+        infos.append(info)
+        if not segments:
+            no_coast.append(ndwi_file.name)
+            continue
+        frames.append(write_scene_outputs(stem, date, segments, crs, aoi_gdf, output_dir))
+
+    if not frames:
+        raise RuntimeError("No se encontró costa en ninguna escena.")
+
+    all_df = pd.concat(frames, ignore_index=True)
+    all_path = output_dir / "all_shorelines.csv"
+    all_df.to_csv(all_path, index=False)
+    pd.DataFrame(infos).to_csv(output_dir / "extraction_params.csv", index=False)
+    with open(output_dir / "shorelines_meta.json", "w") as f:
+        json.dump({"crs": crs_used.to_string(), **{k: params[k] for k in
+                   ("threshold_mode", "min_area_px", "min_length_m", "closing_radius")}}, f, indent=2)
+
+    print(f"Escenas procesadas: {len(frames)} de {len(chosen)}")
+    if skipped:
+        print(f"Escenas duplicadas por fecha descartadas (más nubes): {', '.join(skipped)}")
     if no_coast:
-        print(f"No coastline found in {len(no_coast)} mask(s): {', '.join(no_coast)}")
-    if SAVE_CLEAN_MASKS:
-        print(f"Clean masks saved in {clean_dir}")
-    print(f"Wrote {all_edges_csv_path}")
+        print(f"Sin costa en {len(no_coast)} escena(s): {', '.join(no_coast)}")
+    print(f"Escrito {all_path}")
+    return all_df, pd.DataFrame(infos)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Extract shoreline edge points from binary water/land mask GeoTIFFs."
-    )
-    parser.add_argument(
-        "-p",
-        "--project",
-        required=True,
-        help="Project name under coastline_estimator/projects.",
-    )
-    parser.add_argument(
-        "--mask-dir",
-        help="Directory containing binary mask GeoTIFFs. Defaults to the project output mask directory.",
-    )
-    parser.add_argument(
-        "--polygon",
-        help="AOI polygon GeoJSON. Defaults to the project input polygon.geojson.",
-    )
-    parser.add_argument(
-        "--clean-dir",
-        help="Directory where the closed (denoised) masks are saved. "
-        "Defaults to output/estimated_waterbodies_images_closed in the project.",
-    )
-    parser.add_argument(
-        "--closing-radius",
-        type=int,
-        default=CLOSING_RADIUS,
-        help=f"Disk radius in pixels for the morphological closing (0 disables it). Default: {CLOSING_RADIUS}.",
-    )
-    args = parser.parse_args()
-    main(args.project, args.mask_dir, args.polygon, args.clean_dir, args.closing_radius)
+    parser = argparse.ArgumentParser(description="Extrae la costa (contornos subpíxel) de los NDWI.")
+    parser.add_argument("-p", "--project", default=config.NOMBRE_PROYECTO)
+    parser.add_argument("--ndwi-dir", help="Carpeta con los NDWI .tif (por defecto, la del proyecto).")
+    parser.add_argument("--polygon", help="GeoJSON del AOI (por defecto, el del proyecto).")
+    parser.add_argument("--clean-dir", help="Dónde guardar las máscaras limpias.")
+    parser.add_argument("--threshold-mode", choices=["otsu", "fixed"], default=None)
+    parser.add_argument("--threshold", type=float, default=None, help="Umbral fijo (modo fixed o fallback).")
+    parser.add_argument("--min-area-px", type=int, default=None)
+    parser.add_argument("--min-length-m", type=float, default=None)
+    parser.add_argument("--closing-radius", type=int, default=None, help="0 = desactivado.")
+    a = parser.parse_args()
+    main(a.project, a.ndwi_dir, a.polygon, a.clean_dir, a.threshold_mode, a.threshold,
+         a.min_area_px, a.min_length_m, a.closing_radius)

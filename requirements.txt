@@ -1,0 +1,12 @@
+requests
+numpy
+pandas
+scipy
+scikit-image
+rasterio
+geopandas
+shapely>=2.0
+pyproj
+matplotlib
+pillow
+tqdm

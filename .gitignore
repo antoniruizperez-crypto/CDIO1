@@ -1,0 +1,10 @@
+# Datos pesados y resultados
+Imagenes/
+Imagenes_test/
+projects/*/output/
+projects/_test*/
+__pycache__/
+*.pyc
+# Credenciales: nunca al repositorio
+.env
+*.part
