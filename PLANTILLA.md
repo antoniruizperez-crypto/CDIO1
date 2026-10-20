@@ -29,7 +29,7 @@ La zona de estudio configurada actualmente corresponde a un área costera de Bar
 - [Productos y resultados](#productos-y-resultados)
 - [Primeros pasos](#primeros-pasos)
 - [Tecnologías](#tecnologías)
-- [Próxima fase](#próxima-fase--sesión-9)
+- [Próxima fase](#próxima-fase)
 - [Alcance y limitaciones](#alcance-y-limitaciones)
 - [Equipo](#equipo)
 
