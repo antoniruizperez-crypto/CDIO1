@@ -59,16 +59,16 @@ También permite comparar una costa estimada con una referencia externa y calcul
 
 ## ✨ Funcionalidades actuales
 
-- 📥 Descarga de productos Sentinel-2 por zona, fechas y nubosidad.
-- 🖼️ Generación de composiciones RGB e imágenes de NDWI.
-- 🌊 Clasificación del agua mediante un umbral de NDWI.
-- 🧹 Limpieza morfológica de máscaras.
-- 📍 Extracción de puntos del borde agua-tierra.
-- 🗺️ Exportación a CSV, GeoJSON y KMZ.
-- 📏 Medición de desplazamientos mediante transectos.
-- 📊 Estadísticas de distancias y cobertura por fecha.
-- ✅ Comparación con referencias externas.
-- 📈 Visualización de resultados espaciales y temporales.
+- 📥 Descarga de productos Sentinel-2 por zona, fechas y nubosidad. (descarga_copernicus.py)
+- 🖼️ Generación de composiciones RGB e imágenes de NDWI. (sesion5.py)
+- 🌊 Clasificación del agua mediante un umbral de NDWI. (sesion5.py)
+- 🧹 Limpieza morfológica de máscaras. (extract_shorelines.py) /guarda en estimated_waterbodies_closed
+- 📍 Extracción de puntos del borde agua-tierra. (extract_shorelines.py)
+- 🗺️ Exportación a CSV, GeoJSON y KMZ. (extract_shorelines.py)
+- 📏 Medición de desplazamientos mediante transectos. (extract_shorelines.py)/guarda en estimated_waterbodies_edges
+- 📊 Estadísticas de distancias y cobertura por fecha. (analyze.py) & (calculate_erosion.py)
+- ✅ Comparación con referencias externas. (error_estimator.py)
+- 📈 Visualización de resultados espaciales y temporales. (calculate_erosion.py)
 
 ## 📂 Archivos principales
 
