@@ -119,16 +119,16 @@ Las credenciales deben mantenerse fuera del código y del repositorio.
 - Gráficas comparativas y de evolución temporal.
 - Registro del procesamiento y de los errores encontrados.
 
-## 🔬 Próximos pasos
+## 🔬 Próximos pasos 
 
-- Unificar la configuración y las rutas.
-- Consolidar los procesadores en una única versión configurable.
-- Mejorar la gestión de errores.
-- Incorporar análisis de series temporales.
-- Ajustar regresiones lineales respecto al tiempo.
-- Interpretar las pendientes como tasas de cambio.
+- Aplicar los fundamentos de las series temporales a las medidas de posición de la costa.
+- Preparar y explorar los datos: ordenar las observaciones por fecha, revisar valores ausentes y calcular estadísticas descriptivas.
+- Visualizar la evolución temporal de las medidas mediante herramientas de Python.
+- Identificar patrones, tendencias y posibles anomalías en los datos temporales.
+- Introducir el aprendizaje automático supervisado mediante modelos de regresión lineal.
+- Ajustar regresiones lineales para estudiar la relación entre el tiempo y la posición de la costa.
+- Interpretar físicamente los parámetros del modelo, especialmente la pendiente como tasa de cambio.
 - Evaluar los ajustes mediante MAE, RMSE y R².
-- Analizar residuos y posibles anomalías.
 
 Estas ampliaciones no se presentan como implementadas en los módulos actuales.
 
