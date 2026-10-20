@@ -9,26 +9,26 @@ import rasterio
 from pyproj import Transformer
 from rasterio.features import geometry_mask
 from scipy.ndimage import binary_erosion, convolve
-from skimage.morphology import closing, disk
-from tqdm import tqdm
 
 import shoreline_utils as utils
 
-# Radio (en píxeles, 1 px = 10 m) del disco usado en el "closing" morfológico.
-# El closing rellena manchas de tierra (0) dentro del agua (1): radio 1 rellena
-# huecos de hasta ~2 px de ancho (~20 m), radio 2 hasta ~4 px (~40 m).
-# 0 desactiva la limpieza.
-CLOSING_RADIUS = 1
 
-# True  -> guarda las máscaras limpias (tras el closing) como GeoTIFF en clean_dir.
-# False -> no guarda nada (ni crea la carpeta); el closing se aplica igualmente
-#          en memoria para calcular los bordes.
-SAVE_CLEAN_MASKS = True
+# Cada proceso mantiene en RAM la máscara (uint8), la máscara del AOI, el
+# resultado de la convolución y varios arrays booleanos: del orden de 1 GB
+# para un tile de 10 m. Estimación; ajústala si mides otro pico.
+GB_POR_PROCESO = 2
+MAX_PROCESOS_DEFECTO = 4
 
 
 def reproject_coords_to_latlon(coords, src_crs):
+    # Una sola llamada vectorizada: antes se llamaba a pyproj una vez por punto
+    # en un bucle de Python, que era mucho más lento con miles de puntos.
+    if len(coords) == 0:
+        return []
     transformer = Transformer.from_crs(src_crs, "EPSG:4326", always_xy=True)
-    return [transformer.transform(x, y) for x, y in coords]
+    arr = np.asarray(coords, dtype=float)
+    lons, lats = transformer.transform(arr[:, 0], arr[:, 1])
+    return list(zip(np.asarray(lons).tolist(), np.asarray(lats).tolist()))
 
 
 def export_coords_to_csv_latlon(coords, output_csv_path, date):
@@ -58,42 +58,9 @@ def read_mask_band(src):
     return src.read()[0]
 
 
-def denoise_mask(mask_image, radius=CLOSING_RADIUS):
-    """
-    Rellena las manchas de tierra (0) dentro del agua (1) con un "closing"
-    morfológico: dilatación + erosión, ambas con un disco de 'radio' px.
-
-    - La dilatación tapa los huecos de tierra más pequeños que el disco.
-    - La erosión posterior devuelve a su tamaño original el agua, así que la
-      costa real no se desplaza.
-    - Un closing solo puede añadir píxeles de agua, nunca quitarlos.
-    """
-    binary = (mask_image > 0).astype(np.uint8)
-    if radius <= 0:
-        return binary
-    return closing(binary, disk(radius)).astype(np.uint8)
-
-
-def save_mask_tif(mask, output_path, src_profile):
-    """Guarda la máscara limpia como GeoTIFF uint8 (0 = tierra, 1 = agua), georreferenciada."""
-    profile = src_profile.copy()
-    profile.update(driver="GTiff", dtype=rasterio.uint8, count=1, nodata=None)
-    with rasterio.open(output_path, "w", **profile) as dst:
-        dst.write(mask.astype(np.uint8), 1)
-
-
-def estimate_mask_edges(mask_file, aoi_proj, aoi_gdf, output_dir, clean_dir, closing_radius=CLOSING_RADIUS):
+def estimate_mask_edges(mask_file, aoi_proj, aoi_gdf, output_dir):
     with rasterio.open(mask_file) as src:
-        raw_mask = read_mask_band(src)
-
-        # Denoising: closing sobre la máscara antes de calcular los bordes
-        mask_image = denoise_mask(raw_mask, closing_radius)
-
-        # Se guarda la máscara limpia en una carpeta APARTE de la de entrada
-        # (si estuviera en mask_dir, se volvería a procesar como una máscara más).
-        if SAVE_CLEAN_MASKS:
-            save_mask_tif(mask_image, clean_dir / f"{mask_file.stem}_closed.tif", src.profile)
-
+        mask_image = read_mask_band(src)
         aoi_mask = geometry_mask(
             [geom for geom in aoi_proj.geometry],
             transform=src.transform,
@@ -178,7 +145,12 @@ def merge_edge_csvs(output_dir):
     return all_edges_csv_path
 
 
-def main(project, mask_dir=None, polygon_path=None, clean_dir=None, closing_radius=CLOSING_RADIUS):
+def _procesar_mascara(mask_file, aoi_proj, aoi_gdf, output_dir):
+    """Función de nivel de módulo (necesario para enviarla a otro proceso)."""
+    return estimate_mask_edges(mask_file, aoi_proj, aoi_gdf, output_dir)
+
+
+def main(project, mask_dir=None, polygon_path=None, workers=None):
     project_dir = utils.project_path(project)
     input_dir = project_dir / "input"
     output_dir = project_dir / "output" / "estimated_waterbodies_edges"
@@ -186,9 +158,6 @@ def main(project, mask_dir=None, polygon_path=None, clean_dir=None, closing_radi
 
     mask_dir = Path(mask_dir) if mask_dir else project_dir / "output" / "estimated_waterbodies_images"
     polygon_path = Path(polygon_path) if polygon_path else input_dir / "polygon.geojson"
-    clean_dir = Path(clean_dir) if clean_dir else project_dir / "output" / "estimated_waterbodies_images_closed"
-    if SAVE_CLEAN_MASKS:
-        clean_dir.mkdir(parents=True, exist_ok=True)
 
     if not mask_dir.is_dir():
         raise FileNotFoundError(f"Mask directory does not exist: {mask_dir}")
@@ -204,23 +173,36 @@ def main(project, mask_dir=None, polygon_path=None, clean_dir=None, closing_radi
         raster_crs = src.crs
     aoi_proj = aoi_gdf.to_crs(raster_crs)
 
-    # Se procesan TODAS las máscaras de mask_dir en cada ejecución: no se salta
-    # ninguna aunque ya tenga resultados de una ejecución anterior (se
-    # sobrescriben).
+    # Las máscaras que ya tienen su _xyz.csv se saltan (como antes).
     processed = 0
-    no_coast = []
-    for mask_file in tqdm(mask_files, desc="Extracting shoreline edges"):
-        if estimate_mask_edges(mask_file, aoi_proj, aoi_gdf, output_dir, clean_dir, closing_radius):
+    pending = {}
+    for mask_file in mask_files:
+        csv_xy_path = output_dir / f"{mask_file.stem}_xyz.csv"
+        if csv_xy_path.exists() and csv_xy_path.stat().st_size > 0:
             processed += 1
         else:
-            no_coast.append(mask_file.name)
+            pending[mask_file.name] = (mask_file, aoi_proj, aoi_gdf, output_dir)
+
+    if pending:
+        workers = workers or utils.default_workers(GB_POR_PROCESO, MAX_PROCESOS_DEFECTO)
+        workers = max(1, min(workers, utils.MAX_WORKERS_HARD, len(pending)))
+        print(f"Extracting shoreline edges from {len(pending)} masks, {workers} at a time...")
+
+        results, errors, failed = utils.run_parallel(
+            _procesar_mascara, pending, workers, desc="Extracting shoreline edges"
+        )
+
+        processed += sum(1 for ok in results.values() if ok)
+        for name, error in errors.items():
+            print(f"ERROR in {name}: {error}")
+        if failed:
+            print(
+                f"{len(failed)} mask(s) could not be processed (worker killed, probably out of RAM): "
+                f"{', '.join(failed)}. Try --workers 1 or free memory."
+            )
 
     all_edges_csv_path = merge_edge_csvs(output_dir)
-    print(f"Processed {processed} of {len(mask_files)} mask files.")
-    if no_coast:
-        print(f"No coastline found in {len(no_coast)} mask(s): {', '.join(no_coast)}")
-    if SAVE_CLEAN_MASKS:
-        print(f"Clean masks saved in {clean_dir}")
+    print(f"Processed {processed} mask files.")
     print(f"Wrote {all_edges_csv_path}")
 
 
@@ -243,15 +225,11 @@ if __name__ == "__main__":
         help="AOI polygon GeoJSON. Defaults to the project input polygon.geojson.",
     )
     parser.add_argument(
-        "--clean-dir",
-        help="Directory where the closed (denoised) masks are saved. "
-        "Defaults to output/estimated_waterbodies_images_closed in the project.",
-    )
-    parser.add_argument(
-        "--closing-radius",
+        "-w",
+        "--workers",
         type=int,
-        default=CLOSING_RADIUS,
-        help=f"Disk radius in pixels for the morphological closing (0 disables it). Default: {CLOSING_RADIUS}.",
+        default=None,
+        help=f"Masks processed at once (default: automatic, max {MAX_PROCESOS_DEFECTO}; hard limit {utils.MAX_WORKERS_HARD}). Use 1 to run serially.",
     )
     args = parser.parse_args()
-    main(args.project, args.mask_dir, args.polygon, args.clean_dir, args.closing_radius)
+    main(args.project, args.mask_dir, args.polygon, args.workers)
