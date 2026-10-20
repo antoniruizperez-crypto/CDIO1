@@ -29,7 +29,7 @@ La zona de estudio configurada actualmente corresponde a un área costera de Bar
 - [Productos y resultados](#productos-y-resultados)
 - [Primeros pasos](#primeros-pasos)
 - [Tecnologías](#tecnologías)
-- [Próxima fase · Sesión 9](#próxima-fase--sesión-9)
+- [Próxima fase](#próxima-fase--sesión-9)
 - [Alcance y limitaciones](#alcance-y-limitaciones)
 - [Equipo](#equipo)
 
@@ -170,7 +170,7 @@ Los productos visuales del procesamiento y su registro se guardan también en la
 
 ---
 
-## Próxima fase · Sesión 9
+## Próxima fase 
 
 La siguiente ampliación se centra en el análisis temporal y la introducción al aprendizaje automático mediante regresión lineal.
 
