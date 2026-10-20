@@ -147,7 +147,7 @@ Estas ampliaciones no se presentan como implementadas en los módulos actuales.
 
 - Antoni Ruiz.
 - Joel Garcia.
-- Jan .
+- Jan Aleksander Fernández.
 - Kaua Vieira.
 
 ## 🛰️ Estado del proyecto
