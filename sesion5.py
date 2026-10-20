@@ -28,7 +28,10 @@ debe estar en la misma carpeta que este script (Code/).
 
 import os
 import csv
+import argparse
+import multiprocessing
 import xml.etree.ElementTree as ET
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -333,9 +336,6 @@ def procesar_zip(zip_path, carpeta_salida):
         if nivel == "L2A":
             _procesar_l2a(zip_path, carpeta_salida, resultado)
 
-        elif nivel == "L1C":
-            _procesar_l1c(zip_path, resultado)
-
         else:
             raise ValueError("No se pudo determinar el nivel de procesamiento (ni L1C ni L2A)")
 
@@ -409,28 +409,6 @@ def _procesar_l2a(zip_path, carpeta_salida, resultado):
         resultado["archivo_waterbody"] = nombre_waterbody
 
 
-def _procesar_l1c(zip_path, resultado):
-    """
-    Flujo reducido para productos L1C: sin SCL disponible, se usa el %
-    de nubosidad global del XML de metadatos solo para registro y
-    filtrado. No se generan imágenes de costa ni NDWI, porque la
-    reflectancia L1C (TOA, sin corrección atmosférica) y la ausencia de
-    una máscara de nubes por píxel hacen que esos productos sean menos
-    fiables que un L2A equivalente.
-    """
-    ruta_xml = buscar_archivo_en_zip(zip_path, "MTD_MSIL1C.xml")
-    if ruta_xml is None:
-        raise FileNotFoundError("No se encontró el XML de metadatos MTD_MSIL1C.xml en el zip")
-
-    porcentaje = leer_nubosidad_xml_l1c(zip_path, ruta_xml)
-    resultado["porcentaje_nubosidad"] = round(porcentaje, 2)
-    resultado["paso_filtro"] = porcentaje <= UMBRAL_NUBOSIDAD
-    resultado["observaciones"] = (
-        "L1C: % de nubosidad global desde XML (sin máscara por píxel); "
-        "no se generan imágenes de costa ni NDWI para este nivel."
-    )
-
-
 # ---------------------------------------------------------------------------
 # Registro CSV
 # ---------------------------------------------------------------------------
@@ -460,7 +438,90 @@ def escribir_registro(csv_path, filas):
 # Programa principal
 # ---------------------------------------------------------------------------
 
-def main():
+# Límites de procesos simultáneos. Cada zip L2A puede llegar a 5-7 GB de RAM
+# en su pico (4 bandas de 10m en float32 + NDWI + RGB + copias temporales),
+# por eso el tope es bajo. Son estimaciones: mide tu pico real (ver la nota
+# al final de este archivo) y ajusta estas constantes.
+GB_POR_PROCESO = 8          # RAM que se reserva por proceso al calcular el valor por defecto
+MAX_PROCESOS_DEFECTO = 2    # tope del valor automático
+MAX_PROCESOS_ABSOLUTO = 4   # tope duro, aunque se pida más con --workers
+
+
+def workers_por_defecto():
+    """
+    Procesos paralelos por defecto: el menor entre MAX_PROCESOS_DEFECTO,
+    (núcleos - 1) y (RAM total / GB_POR_PROCESO). Siempre al menos 1.
+    """
+    nucleos = os.cpu_count() or 1
+    try:
+        ram_gb = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9
+    except (ValueError, OSError, AttributeError):
+        ram_gb = 8  # valor conservador si no se puede consultar
+    return max(1, min(MAX_PROCESOS_DEFECTO, nucleos - 1, int(ram_gb // GB_POR_PROCESO)))
+
+
+def _registrar_resultado(resultado, zip_path, mover=True):
+    """
+    Imprime el resultado de un zip y, si mover=True, lo pasa a procesados.
+    Con mover=False el zip se queda en la carpeta de entrada para poder
+    reintentarlo (se usa cuando el worker murió, p.ej. por falta de RAM).
+    """
+    nombre = resultado["zip"]
+    if resultado.get("error"):
+        print(f"  [{nombre}] ERROR: {resultado['error']}")
+    else:
+        print(
+            f"  [{nombre}] Nivel: {resultado['nivel_procesamiento']} "
+            f"- Nubosidad: {resultado['porcentaje_nubosidad']}% "
+            f"- Pasa filtro: {resultado['paso_filtro']}"
+        )
+    if mover:
+        os.rename(zip_path, os.path.join(CARPETA_PROCESADOS, nombre))
+
+
+def _procesar_en_pool(nombres, rutas, workers, resultados, ultimo_intento=False):
+    """
+    Procesa los zips indicados con un pool de procesos y devuelve la lista de
+    los que fallaron porque el worker murió (p.ej. sin RAM).
+
+    - Los workers solo calculan y escriben sus propios archivos de salida
+      (nombres únicos por zip); el CSV y el movimiento de zips los hace solo
+      el proceso principal, así nunca hay dos procesos escribiendo lo mismo.
+    - max_tasks_per_child=1: cada proceso muere tras un zip y devuelve toda su
+      memoria al sistema (Python/glibc no la devuelven del todo dentro de un
+      proceso largo). Exige el contexto "spawn".
+    - Nunca hay más de `workers` zips en memoria a la vez.
+    - Un zip con error NORMAL (p.ej. falta una banda) se registra y se mueve
+      a procesados, como antes. Uno cuyo worker murió NO se mueve.
+    """
+    contexto = multiprocessing.get_context("spawn")
+    caidos = []
+    with ProcessPoolExecutor(
+        max_workers=workers, mp_context=contexto, max_tasks_per_child=1
+    ) as pool:
+        futuros = {pool.submit(procesar_zip, rutas[n], CARPETA_SALIDA): n for n in nombres}
+        for futuro in as_completed(futuros):
+            nombre = futuros[futuro]
+            try:
+                resultado = futuro.result()
+            except Exception as e:
+                if ultimo_intento:
+                    # Ya se reintentó solo: se deja constancia en el CSV.
+                    resultado = {
+                        "zip": nombre,
+                        "fecha_proceso": datetime.now().isoformat(timespec="seconds"),
+                        "error": f"Worker caído incluso en solitario (¿poca RAM?): {e}",
+                    }
+                    resultados.append(resultado)
+                    _registrar_resultado(resultado, rutas[nombre], mover=False)
+                caidos.append(nombre)
+                continue
+            resultados.append(resultado)
+            _registrar_resultado(resultado, rutas[nombre])
+    return caidos
+
+
+def main(workers=None):
     os.makedirs(CARPETA_SALIDA, exist_ok=True)
     os.makedirs(CARPETA_PROCESADOS, exist_ok=True)
     os.makedirs(CARPETA_WATERBODY, exist_ok=True)
@@ -475,28 +536,71 @@ def main():
         print(f"No se encontraron archivos .zip en {CARPETA_ENTRADA}")
         return
 
+    workers = workers or workers_por_defecto()
+    if workers > MAX_PROCESOS_ABSOLUTO:
+        print(f"Aviso: se pidieron {workers} procesos; se limita a {MAX_PROCESOS_ABSOLUTO} para no agotar la RAM.")
+        workers = MAX_PROCESOS_ABSOLUTO
+    workers = max(1, min(workers, len(zips)))
+    print(f"Procesando {len(zips)} zips con un máximo de {workers} a la vez...")
+
+    rutas = {n: os.path.join(CARPETA_ENTRADA, n) for n in zips}
     resultados = []
-    for nombre in zips:
-        zip_path = os.path.join(CARPETA_ENTRADA, nombre)
-        print(f"Procesando {nombre}...")
 
-        resultado = procesar_zip(zip_path, CARPETA_SALIDA)
-        resultados.append(resultado)
-
-        if resultado["error"]:
-            print(f"  ERROR: {resultado['error']}")
+    try:
+        if workers == 1:
+            # Sin pool: más fácil de depurar y sin sobrecoste de procesos.
+            for nombre, zip_path in rutas.items():
+                print(f"Procesando {nombre}...")
+                resultado = procesar_zip(zip_path, CARPETA_SALIDA)
+                resultados.append(resultado)
+                _registrar_resultado(resultado, zip_path)
         else:
-            print(
-                f"  Nivel: {resultado['nivel_procesamiento']} "
-                f"- Nubosidad: {resultado['porcentaje_nubosidad']}% "
-                f"- Pasa filtro: {resultado['paso_filtro']}"
-            )
+            caidos = _procesar_en_pool(list(rutas), rutas, workers, resultados)
 
-        os.rename(zip_path, os.path.join(CARPETA_PROCESADOS, nombre))
+            if caidos:
+                # Cuando un worker muere, el pool entero se rompe y fallan
+                # también los zips que ni habían empezado. Se reintentan de
+                # uno en uno (en un proceso aislado, para que otra caída no
+                # tumbe este programa). Solo los que vuelvan a caer quedan
+                # sin procesar.
+                print(f"\n{len(caidos)} zip(s) afectados por una caída de worker; reintentando de uno en uno...")
+                pendientes, caidos = caidos, []
+                for nombre in pendientes:
+                    # Un pool nuevo por zip: si uno vuelve a matar a su worker,
+                    # no arrastra a los demás.
+                    caidos += _procesar_en_pool([nombre], rutas, 1, resultados, ultimo_intento=True)
 
-    escribir_registro(CSV_LOG, resultados)
-    print(f"\nProcesamiento completo. Registro guardado en: {CSV_LOG}")
+            if caidos:
+                print(
+                    f"\n{len(caidos)} zip(s) NO se pudieron procesar y siguen en la carpeta de entrada: "
+                    f"{', '.join(caidos)}\n"
+                    "Casi seguro es falta de RAM con un zip concreto. Mide su pico (nota al final "
+                    "del archivo) o cierra otros programas y vuelve a ejecutar."
+                )
+    finally:
+        # Aunque se interrumpa con Ctrl+C, se guarda lo ya procesado.
+        if resultados:
+            escribir_registro(CSV_LOG, resultados)
+            print(f"\nRegistro guardado en: {CSV_LOG}")
+
+    print("\nProcesamiento completo.")
 
 
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser(description="Procesa por lotes los zips Sentinel-2.")
+    ap.add_argument(
+        "-w", "--workers", type=int, default=None,
+        help=(
+            f"Zips procesados a la vez (por defecto, según núcleos y RAM, máx. "
+            f"{MAX_PROCESOS_DEFECTO}; tope duro {MAX_PROCESOS_ABSOLUTO}). Usa 1 para ir en serie."
+        ),
+    )
+    args = ap.parse_args()
+    main(args.workers)
+
+# Cómo medir el pico real de RAM de un zip (para ajustar GB_POR_PROCESO):
+#   1. Deja un solo zip en la carpeta de entrada.
+#   2. /usr/bin/time -v python Code/procesar_sentinel2.py -w 1
+#   3. Mira "Maximum resident set size (kbytes)" al final. Divide entre 1.000.000 para GB.
+#   4. procesos = (RAM libre - 2 GB) // pico
+# Ejemplo: pico de 6 GB y 16 GB de RAM -> (16 - 2) // 6 = 2 procesos.
