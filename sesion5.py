@@ -101,56 +101,6 @@ def ruta_vsizip(zip_path, ruta_interna):
     """
     return f"/vsizip/{os.path.abspath(zip_path)}/{ruta_interna}"
 
-
-# ---------------------------------------------------------------------------
-# Detección de nivel de procesamiento (L1C / L2A)
-# ---------------------------------------------------------------------------
-
-def detectar_nivel_procesamiento(zip_path):
-    """
-    Determina si el producto es L1C o L2A. Primero mira el nombre del zip
-    (convención oficial de la ESA: 'MSIL1C' / 'MSIL2A'), y si no es
-    concluyente, busca el XML de metadatos correspondiente dentro del zip.
-
-    Devuelve "L1C", "L2A" o "DESCONOCIDO".
-    """
-    nombre = os.path.basename(zip_path)
-
-    if "MSIL2A" in nombre:
-        return "L2A"
-    if "MSIL1C" in nombre:
-        return "L1C"
-
-    # Nombre no concluyente (p.ej. si el archivo fue renombrado):
-    # se busca el XML de metadatos propio de cada nivel.
-    if buscar_archivo_en_zip(zip_path, "MTD_MSIL2A.xml"):
-        return "L2A"
-    if buscar_archivo_en_zip(zip_path, "MTD_MSIL1C.xml"):
-        return "L1C"
-
-    return "DESCONOCIDO"
-
-
-def leer_nubosidad_xml_l1c(zip_path, ruta_xml):
-    """
-    Lee el % de nubosidad global de la escena desde el XML de metadatos
-    de un producto L1C (campo 'Cloud_Coverage_Assessment').
-
-    Es un único valor para todo el granulado (no una máscara por píxel),
-    calculado por la ESA.
-    """
-    with zipfile.ZipFile(zip_path) as z:
-        contenido = z.read(ruta_xml)
-
-    root = ET.fromstring(contenido)
-    for elemento in root.iter():
-        etiqueta = elemento.tag.split("}")[-1]  # quita el namespace XML
-        if etiqueta == "Cloud_Coverage_Assessment":
-            return float(elemento.text)
-
-    raise ValueError("No se encontró 'Cloud_Coverage_Assessment' en el XML del producto L1C")
-
-
 # ---------------------------------------------------------------------------
 # Cálculo de nubosidad a partir de la SCL
 # ---------------------------------------------------------------------------
@@ -330,15 +280,7 @@ def procesar_zip(zip_path, carpeta_salida):
     }
 
     try:
-        nivel = detectar_nivel_procesamiento(zip_path)
-        resultado["nivel_procesamiento"] = nivel
-
-        if nivel == "L2A":
-            _procesar_l2a(zip_path, carpeta_salida, resultado)
-
-        else:
-            raise ValueError("No se pudo determinar el nivel de procesamiento (ni L1C ni L2A)")
-
+        _procesar_l2a(zip_path, carpeta_salida, resultado)
     except Exception as e:
         resultado["error"] = str(e)
 
