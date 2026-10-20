@@ -2,8 +2,6 @@
 Descarga de imágenes Sentinel-2 L2A desde Copernicus Data Space Ecosystem
 (CDSE) para el área definida en un GeoJSON.
 
-Para correr el código ejecutamos en el terminal directamente: "python descarga_copernicus.py --inicio fechadesde --fin fechahasta"
-
 Los .zip se guardan en CARPETA_ENTRADA, listos para sesion5.py.
 
 Requiere: requests
@@ -19,10 +17,21 @@ Uso:
 
 import os
 import json
+import time
+import shutil
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 
 import requests
+
+# Descargas simultáneas. La descarga está limitada por red, no por CPU, así
+# que bastan hilos. CDSE limita las conexiones por usuario (creo que a 4;
+# compruébalo en su documentación de cuotas): con más hilos darían errores 429.
+DESCARGAS_PARALELAS = 3
+MAX_DESCARGAS_ABSOLUTO = 4   # tope duro aunque se pida más con --workers
+REINTENTOS = 3
+MARGEN_DISCO_GB = 5          # espacio libre que se respeta siempre
 
 # ---------------------------------------------------------------------------
 # Configuración
@@ -33,7 +42,7 @@ import requests
 CDSE_USER = "antoni.ruiz.perez@estudiantat.upc.edu"
 CDSE_PASSWORD = "00Copernicus*"
 
-GEOJSON_PATH = "projects/costa_principal/input/polygon.geojson"
+GEOJSON_PATH = "Code/projects/costa_principal/input/polygon.geojson"
 CARPETA_ENTRADA = "Imagenes/zips_entrada"
 CARPETA_PROCESADOS = "Imagenes/zips_procesados"
 
@@ -117,19 +126,33 @@ def obtener_token(usuario, password):
 
 def descargar_producto(producto, destino_zip, usuario, password):
     """Descarga un producto en streaming; escribe a .part y renombra al terminar."""
-    token = obtener_token(usuario, password)
     url = URL_DESCARGA.format(id=producto["Id"])
     parcial = destino_zip + ".part"
 
-    with requests.get(
-        url, headers={"Authorization": f"Bearer {token}"}, stream=True, timeout=120
-    ) as r:
-        r.raise_for_status()
-        with open(parcial, "wb") as f:
-            for trozo in r.iter_content(chunk_size=8 * 1024 * 1024):
-                f.write(trozo)
+    ultimo_error = None
+    for intento in range(1, REINTENTOS + 1):
+        try:
+            # Token nuevo en cada intento: caduca a los ~10 min y una
+            # descarga grande reintentada podría llegar con uno vencido.
+            token = obtener_token(usuario, password)
+            with requests.get(
+                url, headers={"Authorization": f"Bearer {token}"}, stream=True, timeout=120
+            ) as r:
+                r.raise_for_status()
+                with open(parcial, "wb") as f:
+                    for trozo in r.iter_content(chunk_size=8 * 1024 * 1024):
+                        f.write(trozo)
 
-    os.rename(parcial, destino_zip)
+            os.rename(parcial, destino_zip)
+            return
+        except Exception as e:
+            ultimo_error = e
+            if os.path.exists(parcial):
+                os.remove(parcial)  # nunca dejar un zip a medias
+            if intento < REINTENTOS:
+                time.sleep(5 * 2 ** (intento - 1))  # 5 s, 10 s...
+
+    raise RuntimeError(f"falló tras {REINTENTOS} intentos: {ultimo_error}")
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +165,10 @@ def main():
     ap.add_argument("--fin", default=date.today().isoformat(), help="YYYY-MM-DD")
     ap.add_argument("--nubosidad", type=float, default=NUBOSIDAD_MAX_ESCENA)
     ap.add_argument("--solo-listar", action="store_true", help="No descarga, solo muestra")
+    ap.add_argument(
+        "-w", "--workers", type=int, default=DESCARGAS_PARALELAS,
+        help=f"Descargas simultáneas (por defecto {DESCARGAS_PARALELAS}; no más de 4)",
+    )
     args = ap.parse_args()
 
     usuario = os.environ.get("CDSE_USER", CDSE_USER)
@@ -156,13 +183,16 @@ def main():
     productos = buscar_productos(wkt, args.inicio, args.fin, args.nubosidad)
     print(f"{len(productos)} productos encontrados.")
 
+    # 1) Decidir qué hay que descargar (rápido, en serie)
+    pendientes = []
+    vistos = set()
     for p in productos:
         nombre_zip = p["Name"].replace(".SAFE", "") + ".zip"
         ruta_entrada = os.path.join(CARPETA_ENTRADA, nombre_zip)
         ruta_procesado = os.path.join(CARPETA_PROCESADOS, nombre_zip)
 
         # Evita bajar de nuevo lo que ya está pendiente o ya procesado
-        if os.path.exists(ruta_entrada) or os.path.exists(ruta_procesado):
+        if os.path.exists(ruta_entrada) or os.path.exists(ruta_procesado) or nombre_zip in vistos:
             print(f"  Ya existe, se omite: {nombre_zip}")
             continue
 
@@ -172,15 +202,58 @@ def main():
 
         tam_mb = p.get("ContentLength", 0) / 1e6
         print(f"  {nombre_zip}  ({tam_mb:.0f} MB)")
-        if args.solo_listar:
-            continue
+        vistos.add(nombre_zip)
+        pendientes.append((p, nombre_zip, ruta_entrada))
 
-        try:
-            descargar_producto(p, ruta_entrada, usuario, password)
-        except Exception as e:
-            print(f"    ERROR descargando: {e}")
+    if args.solo_listar or not pendientes:
+        print("Nada que descargar." if not args.solo_listar else "")
+        return
 
-    print("Descarga terminada. Ahora puedes ejecutar sesion5.py")
+    # Espacio en disco: los zips se acumulan (sesion5.py los mueve, no los
+    # borra) y pesan ~1 GB cada uno. Se descarga solo lo que cabe, dejando
+    # margen, en vez de llenar el disco a mitad de lote.
+    libre = shutil.disk_usage(CARPETA_ENTRADA).free
+    cabe, usado = [], 0
+    for item in pendientes:
+        tam = item[0].get("ContentLength", 0)
+        if usado + tam > libre - MARGEN_DISCO_GB * 1e9:
+            break
+        usado += tam
+        cabe.append(item)
+    if len(cabe) < len(pendientes):
+        print(
+            f"\nAviso: solo caben {len(cabe)} de {len(pendientes)} productos en el disco "
+            f"({libre / 1e9:.0f} GB libres, margen {MARGEN_DISCO_GB} GB). "
+            "Libera espacio o acota el rango de fechas y vuelve a ejecutar: "
+            "los ya descargados se omiten."
+        )
+        pendientes = cabe
+        if not pendientes:
+            return
+
+    # 2) Descargar en paralelo con hilos. Cada hilo escribe a su propio
+    # .part y solo renombra al terminar, así sesion5.py nunca ve zips a medias.
+    if args.workers > MAX_DESCARGAS_ABSOLUTO:
+        print(f"Aviso: se pidieron {args.workers} hilos; se limita a {MAX_DESCARGAS_ABSOLUTO} (cuota de CDSE).")
+    workers = max(1, min(args.workers, MAX_DESCARGAS_ABSOLUTO, len(pendientes)))
+    print(f"\nDescargando {len(pendientes)} productos con {workers} hilo(s)...")
+    errores = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futuros = {
+            pool.submit(descargar_producto, p, ruta, usuario, password): nombre
+            for p, nombre, ruta in pendientes
+        }
+        for futuro in as_completed(futuros):
+            nombre = futuros[futuro]
+            try:
+                futuro.result()
+                print(f"  OK: {nombre}")
+            except Exception as e:
+                errores += 1
+                print(f"  ERROR descargando {nombre}: {e}")
+
+    print(f"Descarga terminada ({len(pendientes) - errores} correctas, {errores} con error).")
+    print("Ahora puedes ejecutar sesion5.py")
 
 
 if __name__ == "__main__":
