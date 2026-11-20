@@ -4,25 +4,27 @@ Procesamiento Sentinel-2 para costa y preparación de calibración.
 Dependencias:
     pip install rasterio numpy pillow matplotlib
 
-El modo costa necesita también vuestro shoreline_utils.py.
+El modo costa necesita shoreline_utils.py.
 
-Uso habitual:
+Uso para costa:
     python sesion5.py --modo costa
 
-Preparar recortes de aproximadamente 100 m²:
-    python sesion5.py --modo calibracion \
-        --entrada Imagenes/calibracion/shadnagar \
-        --salida Imagenes/calibracion/resultados \
-        --area-m2 100
+Uso para calibración de Shadnagar:
+    python sesion5.py --modo calibracion
+
+Área predeterminada:
+    0,1 km² = 100.000 m².
+
+Para indicar otra área:
+    python sesion5.py --modo calibracion --area-m2 100000
 
 Notas:
-- El área predeterminada es 100 m².
-- En bandas de 10 m, 100 m² corresponde a un píxel.
-- El recorte se ajusta a píxeles originales, sin remuestreo.
-- Para otras áreas, el tamaño se aproxima a píxeles completos.
-- El JSON registra el área realmente exportada.
-- Por defecto no se mueven los ZIP.
-- Este script no calcula RMSE ni ejecuta Sen2Cor.
+- Los recortes se ajustan a píxeles completos, sin remuestreo.
+- El área realmente exportada se guarda en metadatos.json.
+- Se conservan los valores digitales originales en calibración.
+- Los ZIP no se mueven por defecto.
+- Este script no mide el objetivo ni calcula los RMSE.
+- Este script no ejecuta Sen2Cor.
 """
 
 import argparse
@@ -64,7 +66,8 @@ NOMBRE_PROYECTO = "costa_principal"
 UMBRAL_NUBOSIDAD = 10.0
 UMBRAL_NDWI_AGUA = 0.2
 
-AREA_RECORTE_M2 = 100.0
+# 0,1 km² = 100.000 m².
+AREA_RECORTE_M2 = 100000.0
 
 SHADNAGAR_LAT = 17.034261
 SHADNAGAR_LON = 78.183078
@@ -132,11 +135,11 @@ def detectar_nivel(zip_path, miembros):
     if "MSIL1C" in nombre:
         return "L1C"
 
-    if any(Path(p).name == "MTD_MSIL2A.xml" for p in miembros):
-        return "L2A"
+    for nivel in ("L2A", "L1C"):
+        esperado = f"MTD_MSI{nivel}.xml"
 
-    if any(Path(p).name == "MTD_MSIL1C.xml" for p in miembros):
-        return "L1C"
+        if any(Path(p).name == esperado for p in miembros):
+            return nivel
 
     raise ValueError("No se reconoce el nivel L1C/L2A.")
 
@@ -245,9 +248,7 @@ def leer_metadatos(zip_path, ruta_xml, nivel):
         "offsets": offsets,
         "valores_especiales": sorted(valores_especiales),
         "nubosidad_global": (
-            float(nubosidad)
-            if nubosidad is not None
-            else None
+            float(nubosidad) if nubosidad is not None else None
         ),
         "xml_origen": ruta_xml,
     }
@@ -283,9 +284,7 @@ def localizar_scl(miembros):
     ]
 
     if len(candidatos) > 1:
-        raise ValueError(
-            "Se encontraron varias bandas SCL."
-        )
+        raise ValueError("Se encontraron varias bandas SCL.")
 
     return candidatos[0] if candidatos else None
 
@@ -342,11 +341,8 @@ def ventana_objetivo(src, latitud, longitud, area_m2):
     """
     Aproxima un recorte cuadrado a píxeles completos.
 
-    Con 100 m² y píxeles de 10 x 10 m se selecciona un píxel:
-    el que contiene las coordenadas del objetivo.
-
-    No desplaza artificialmente la georreferenciación para
-    centrar el objetivo.
+    El recorte contiene la coordenada del objetivo, pero su
+    centro no coincide necesariamente con ella.
     """
     comprobar_crs_metrico(src)
 
@@ -360,10 +356,12 @@ def ventana_objetivo(src, latitud, longitud, area_m2):
     resolucion_y = abs(src.transform.e)
 
     columnas = max(
-        1, int(math.floor(lado_m / resolucion_x + 0.5))
+        1,
+        int(math.floor(lado_m / resolucion_x + 0.5)),
     )
     filas = max(
-        1, int(math.floor(lado_m / resolucion_y + 0.5))
+        1,
+        int(math.floor(lado_m / resolucion_y + 0.5)),
     )
 
     columnas = min(columnas, src.width)
@@ -373,6 +371,7 @@ def ventana_objetivo(src, latitud, longitud, area_m2):
         max(columna - columnas // 2, 0),
         src.width - columnas,
     )
+
     fila_inicio = min(
         max(fila - filas // 2, 0),
         src.height - filas,
@@ -403,8 +402,7 @@ def leer_raster(
                 args.longitud,
                 args.area_m2,
             )
-            if recortar
-            else None
+            if recortar else None
         )
 
         array = src.read(
@@ -502,7 +500,6 @@ def normalizar(datos, validos):
         valores, [2, 98]
     )
 
-    # Una imagen de un píxel no permite estirar el contraste.
     if maximo <= minimo:
         salida[utilizables] = 127
         return salida
@@ -559,9 +556,7 @@ def guardar_visual_ndwi(ndwi, ruta):
 # Nubosidad, reflectancia y NDWI
 # ---------------------------------------------------------------------------
 
-def nubosidad_scl(
-    zip_path, ruta_scl, args, recortar
-):
+def nubosidad_scl(zip_path, ruta_scl, args, recortar):
     scl, validos, _ = leer_raster(
         zip_path,
         ruta_scl,
@@ -601,9 +596,7 @@ def convertir_reflectancia(datos, banda, meta):
             f"Falta el offset de {banda}."
         )
 
-    offset = offsets.get(
-        identificador, 0.0
-    )
+    offset = offsets.get(identificador, 0.0)
 
     return (
         datos.astype(np.float32) + offset
@@ -648,9 +641,7 @@ def preparar_calibracion(
     args,
     resultado,
 ):
-    carpeta.mkdir(
-        parents=True, exist_ok=True
-    )
+    carpeta.mkdir(parents=True, exist_ok=True)
 
     perfil_referencia = None
     mascara_comun = None
@@ -710,6 +701,7 @@ def preparar_calibracion(
             "resolucion_x_m": resolucion_x,
             "resolucion_y_m": resolucion_y,
             "area_real_m2": area_real,
+            "area_real_km2": area_real / 1_000_000,
             "pixeles_validos": int(validos.sum()),
             "dn_min": (
                 float(valores.min())
@@ -733,7 +725,6 @@ def preparar_calibracion(
             else mascara_comun & validos
         )
 
-    # No se genera una imagen visual engañosa de un solo píxel.
     if (
         perfil_referencia["width"] > 1
         and perfil_referencia["height"] > 1
@@ -747,29 +738,20 @@ def preparar_calibracion(
     documento = {
         **meta,
         "producto": Path(zip_path).stem,
-        "tamano_zip_bytes": (
-            Path(zip_path).stat().st_size
-        ),
+        "tamano_zip_bytes": Path(zip_path).stat().st_size,
         "objetivo_referencia": {
             "latitud": args.latitud,
             "longitud": args.longitud,
             "crs": "EPSG:4326",
         },
         "area_solicitada_m2": args.area_m2,
-        "lado_solicitado_m": math.sqrt(
-            args.area_m2
-        ),
-        "crs_recortes": str(
-            perfil_referencia["crs"]
-        ),
+        "area_solicitada_km2": args.area_m2 / 1_000_000,
+        "lado_solicitado_m": math.sqrt(args.area_m2),
+        "crs_recortes": str(perfil_referencia["crs"]),
         "bandas": resumen_bandas,
         "nubosidad": resultado["nubosidad"],
-        "ambito_nubosidad": resultado[
-            "ambito_nubosidad"
-        ],
-        "scl_disponible": (
-            localizar_scl(miembros) is not None
-        ),
+        "ambito_nubosidad": resultado["ambito_nubosidad"],
+        "scl_disponible": localizar_scl(miembros) is not None,
         "nota": (
             "Valores digitales originales. Recorte ajustado "
             "a píxeles nativos, sin remuestreo. La coordenada "
@@ -779,9 +761,9 @@ def preparar_calibracion(
         ),
     }
 
-    with (
-        carpeta / "metadatos.json"
-    ).open("w", encoding="utf-8") as archivo:
+    with (carpeta / "metadatos.json").open(
+        "w", encoding="utf-8"
+    ) as archivo:
         json.dump(
             documento,
             archivo,
@@ -791,18 +773,10 @@ def preparar_calibracion(
 
     resultado["observaciones"] = (
         f"Recortes preparados. Área solicitada: "
-        f"{args.area_m2} m². "
-        "Consultar dimensiones y área real en metadatos.json."
+        f"{args.area_m2} m² "
+        f"({args.area_m2 / 1_000_000} km²). "
+        "Consultar el área real en metadatos.json."
     )
-
-    if (
-        perfil_referencia["width"] == 1
-        and perfil_referencia["height"] == 1
-    ):
-        resultado["observaciones"] += (
-            " El recorte contiene un único píxel; "
-            "no permite reconocer visualmente el objetivo."
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -826,9 +800,7 @@ def procesar_costa(
         )
         return
 
-    carpeta.mkdir(
-        parents=True, exist_ok=True
-    )
+    carpeta.mkdir(parents=True, exist_ok=True)
 
     bandas = {}
     mascara_comun = None
@@ -951,14 +923,8 @@ def procesar_zip(
 
     try:
         miembros = listar_zip(zip_path)
-
-        nivel = detectar_nivel(
-            zip_path, miembros
-        )
-
-        ruta_xml = localizar_xml(
-            miembros, nivel
-        )
+        nivel = detectar_nivel(zip_path, miembros)
+        ruta_xml = localizar_xml(miembros, nivel)
 
         meta = leer_metadatos(
             zip_path, ruta_xml, nivel
@@ -967,17 +933,13 @@ def procesar_zip(
         resultado.update({
             "nivel": nivel,
             "satelite": meta["satelite"],
-            "fecha_adquisicion": meta[
-                "fecha_adquisicion"
-            ],
+            "fecha_adquisicion": meta["fecha_adquisicion"],
         })
 
         ruta_scl = localizar_scl(miembros)
 
         if nivel == "L2A" and ruta_scl:
-            recortar = (
-                args.modo == "calibracion"
-            )
+            recortar = args.modo == "calibracion"
 
             porcentaje = nubosidad_scl(
                 zip_path,
@@ -986,16 +948,13 @@ def procesar_zip(
                 recortar,
             )
 
-            # La SCL conserva su resolución de 20 m.
             ambito = (
                 "vecindad_objetivo_SCL_20m"
                 if recortar
                 else "tesela_SCL"
             )
         else:
-            porcentaje = meta[
-                "nubosidad_global"
-            ]
+            porcentaje = meta["nubosidad_global"]
             ambito = "producto_XML"
 
         resultado["nubosidad"] = porcentaje
@@ -1020,21 +979,15 @@ def procesar_zip(
                 )
 
             if porcentaje > args.nubosidad:
-                resultado["estado"] = (
-                    "descartado_nubosidad"
-                )
+                resultado["estado"] = "descartado_nubosidad"
                 resultado["observaciones"] = (
                     "No se generan salidas por nubosidad."
                 )
                 return resultado
 
-        carpeta = (
-            salida / Path(zip_path).stem
-        )
+        carpeta = salida / Path(zip_path).stem
 
-        resultado["carpeta_salida"] = str(
-            carpeta
-        )
+        resultado["carpeta_salida"] = str(carpeta)
 
         if args.modo == "calibracion":
             preparar_calibracion(
@@ -1068,9 +1021,7 @@ def procesar_zip(
 
 def escribir_registro(ruta, fila):
     ruta = Path(ruta)
-    ruta.parent.mkdir(
-        parents=True, exist_ok=True
-    )
+    ruta.parent.mkdir(parents=True, exist_ok=True)
 
     tiene_contenido = (
         ruta.exists()
@@ -1156,7 +1107,7 @@ def main():
         default=AREA_RECORTE_M2,
         help=(
             "Área solicitada del recorte en m². "
-            "Predeterminado: 100."
+            "Predeterminado: 100000 m² = 0,1 km²."
         ),
     )
     ap.add_argument(
@@ -1256,9 +1207,7 @@ def main():
             parents=True, exist_ok=True
         )
 
-    salida.mkdir(
-        parents=True, exist_ok=True
-    )
+    salida.mkdir(parents=True, exist_ok=True)
 
     candidatos = (
         entrada.rglob("*")
@@ -1280,15 +1229,16 @@ def main():
 
     if args.modo == "calibracion":
         print(
-            f"Área solicitada: {args.area_m2} m²."
+            f"Área solicitada: {args.area_m2:.2f} m² "
+            f"({args.area_m2 / 1_000_000:.6f} km²)."
         )
         print(
             f"Lado equivalente: "
             f"{math.sqrt(args.area_m2):.2f} m."
         )
         print(
-            "El área real se ajustará a píxeles "
-            "nativos y quedará registrada en el JSON."
+            "El área real se ajustará a píxeles nativos "
+            "y quedará registrada en metadatos.json."
         )
 
     errores = 0
@@ -1315,8 +1265,7 @@ def main():
                 f"  Estado: {resultado['estado']} | "
                 f"Nivel: {resultado['nivel']} | "
                 f"Nubosidad: {resultado['nubosidad']} | "
-                f"Ámbito: "
-                f"{resultado['ambito_nubosidad']}"
+                f"Ámbito: {resultado['ambito_nubosidad']}"
             )
 
             if resultado["observaciones"]:
@@ -1336,9 +1285,7 @@ def main():
                 parents=True, exist_ok=True
             )
 
-            destino = (
-                procesados / zip_path.name
-            )
+            destino = procesados / zip_path.name
 
             if destino.exists():
                 print(
