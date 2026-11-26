@@ -11,6 +11,7 @@ Las funciones de calibración no identifican automáticamente
 el centro del objetivo ni sustituyen la inspección de las bandas.
 """
 
+import hashlib
 import multiprocessing as mp
 import re
 import zipfile
@@ -23,9 +24,15 @@ import pandas as pd
 from pyproj import CRS, Transformer
 from scipy.spatial.distance import cdist
 from shapely.geometry import LineString
+from shapely.ops import linemerge
 
 
 DATE_RE = re.compile(r"(?<!\d)(\d{8})(?!\d)")
+
+# Carpeta del proyecto (donde viven los scripts). Todas las rutas se
+# calculan desde aquí, no desde el directorio de trabajo, para que los
+# scripts funcionen igual lanzados desde el panel, la terminal o un IDE.
+BASE_DIR = Path(__file__).resolve().parent
 
 
 # ---------------------------------------------------------------------------
@@ -47,11 +54,16 @@ def extract_date(name: str):
 
 
 def project_path(project):
-    return (
-        Path(__file__).resolve().parent
-        / "projects"
-        / project
-    )
+    return BASE_DIR / "projects" / project
+
+
+def images_path(*parts):
+    """
+    Carpeta de imágenes descargadas y de productos intermedios
+    (zips, resultados visuales, calibración): BASE_DIR/Imagenes/...
+    Se mantiene fuera de projects/ porque los zips pesan mucho.
+    """
+    return BASE_DIR / "Imagenes" / Path(*parts) if parts else BASE_DIR / "Imagenes"
 
 
 # ---------------------------------------------------------------------------
