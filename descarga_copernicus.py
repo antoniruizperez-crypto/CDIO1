@@ -4,6 +4,15 @@ Descarga de productos Sentinel-2 desde Copernicus Data Space Ecosystem.
 Requiere:
     pip install requests
 
+Credenciales (cuenta gratuita en https://dataspace.copernicus.eu):
+    Ya no están escritas en el código. Se leen, por orden, de:
+      1. Variables de entorno CDSE_USER y CDSE_PASSWORD.
+      2. Un archivo local .cdse_credentials junto a este script, con
+         dos líneas: usuario y contraseña (está en .gitignore).
+      3. Si no hay ninguna y se ejecuta en una terminal, se piden
+         por teclado (la contraseña no se muestra).
+    El panel de control las pasa por variables de entorno.
+
 Compatibilidad con el flujo anterior:
     python descarga_copernicus.py --inicio 2026-06-01 --fin 2026-09-30
 
@@ -24,10 +33,12 @@ Importante:
 
 import argparse
 import csv
+import getpass
 import json
 import math
 import os
 import re
+import sys
 from collections import defaultdict
 from datetime import date
 from pathlib import Path
@@ -39,15 +50,15 @@ import requests
 # Configuración
 # ---------------------------------------------------------------------------
 
-# Las variables de entorno tienen prioridad.
-# No publicar este archivo con credenciales reales.
-CDSE_USER = "antoni.ruiz.perez@estudiantat.upc.edu"
-CDSE_PASSWORD = "00Copernicus*"
+# Las rutas parten de la carpeta del script, no del directorio de trabajo.
+BASE_DIR = Path(__file__).resolve().parent
 
-GEOJSON_PATH = "projects/costa_principal/input/polygon.geojson"
-CARPETA_ENTRADA = "Imagenes/zips_entrada"
-CARPETA_PROCESADOS = "Imagenes/zips_procesados"
-CARPETA_CALIBRACION = "Imagenes/calibracion"
+NOMBRE_PROYECTO = "costa_principal"
+ARCHIVO_CREDENCIALES = BASE_DIR / ".cdse_credentials"
+
+CARPETA_ENTRADA = BASE_DIR / "Imagenes" / "zips_entrada"
+CARPETA_PROCESADOS = BASE_DIR / "Imagenes" / "zips_procesados"
+CARPETA_CALIBRACION = BASE_DIR / "Imagenes" / "calibracion"
 
 NUBOSIDAD_MAX_ESCENA = 40.0
 
@@ -364,6 +375,39 @@ def seleccionar_fechas(grupos, numero, satelites, exigir_todos):
 # Autenticación y descarga
 # ---------------------------------------------------------------------------
 
+def obtener_credenciales():
+    """
+    Devuelve (usuario, password) o (None, None) si no hay credenciales.
+    Orden: variables de entorno, archivo local, petición por teclado.
+    """
+    usuario = os.environ.get("CDSE_USER")
+    password = os.environ.get("CDSE_PASSWORD")
+
+    if usuario and password:
+        return usuario, password
+
+    if ARCHIVO_CREDENCIALES.is_file():
+        lineas = [
+            linea.strip()
+            for linea in ARCHIVO_CREDENCIALES.read_text(
+                encoding="utf-8"
+            ).splitlines()
+            if linea.strip()
+        ]
+
+        if len(lineas) >= 2:
+            return lineas[0], lineas[1]
+
+    if sys.stdin is not None and sys.stdin.isatty():
+        usuario = input("Usuario CDSE (correo): ").strip()
+        password = getpass.getpass("Contraseña CDSE: ")
+
+        if usuario and password:
+            return usuario, password
+
+    return None, None
+
+
 def obtener_token(usuario, password):
     respuesta = requests.post(
         URL_TOKEN,
@@ -454,6 +498,10 @@ def main():
         "--zona", choices=["costa", "shadnagar"], default="costa"
     )
     ap.add_argument(
+        "--proyecto", default=NOMBRE_PROYECTO,
+        help="Proyecto cuyo polygon.geojson define el área (modo costa)."
+    )
+    ap.add_argument(
         "--geojson",
         help="GeoJSON propio; tiene prioridad sobre --zona."
     )
@@ -496,18 +544,36 @@ def main():
 
     args.satelites = list(dict.fromkeys(args.satelites))
 
-    usuario = os.environ.get("CDSE_USER", CDSE_USER)
-    password = os.environ.get("CDSE_PASSWORD", CDSE_PASSWORD)
+    usuario = password = None
 
-    if not args.solo_listar and not (usuario and password):
-        ap.error("Faltan las credenciales de CDSE.")
+    if not args.solo_listar:
+        usuario, password = obtener_credenciales()
+
+        if not (usuario and password):
+            ap.error(
+                "Faltan las credenciales de CDSE. Define CDSE_USER y "
+                "CDSE_PASSWORD, crea .cdse_credentials o ejecuta desde "
+                "una terminal para introducirlas."
+            )
 
     if args.geojson:
-        wkt = geojson_a_wkt(args.geojson)
+        ruta_geojson = Path(args.geojson)
+    else:
+        ruta_geojson = (
+            BASE_DIR / "projects" / args.proyecto
+            / "input" / "polygon.geojson"
+        )
+
+    if args.geojson:
+        wkt = geojson_a_wkt(ruta_geojson)
     elif args.zona == "shadnagar":
         wkt = wkt_shadnagar()
     else:
-        wkt = geojson_a_wkt(GEOJSON_PATH)
+        if not ruta_geojson.is_file():
+            raise SystemExit(
+                f"No existe el polígono del proyecto: {ruta_geojson}"
+            )
+        wkt = geojson_a_wkt(ruta_geojson)
 
     # Solo el modo costa/L2A original conserva la salida antigua.
     modo_original = (
@@ -531,17 +597,30 @@ def main():
 
     productos = []
     for nivel in niveles:
-        encontrados = buscar_productos(
-            wkt, args.inicio, args.fin, args.nubosidad, nivel
-        )
+        try:
+            encontrados = buscar_productos(
+                wkt, args.inicio, args.fin, args.nubosidad, nivel
+            )
+        except requests.RequestException as error:
+            raise SystemExit(
+                f"No se pudo consultar el catálogo de Copernicus: {error}"
+            )
         print(f"{nivel}: {len(encontrados)} productos encontrados.")
         productos.extend(encontrados)
 
     # No seleccionar productos que no están disponibles para descarga.
-    productos = [
+    disponibles = [
         p for p in productos if p.get("Online", True)
     ]
-    productos = deduplicar(productos)
+    archivados = len(productos) - len(disponibles)
+
+    if archivados:
+        print(
+            f"Aviso: {archivados} productos están archivados "
+            "(offline) y se omiten; no se pueden descargar directamente."
+        )
+
+    productos = deduplicar(disponibles)
 
     grupos = crear_grupos(
         productos, exigir_parejas=args.nivel == "AMBOS"
