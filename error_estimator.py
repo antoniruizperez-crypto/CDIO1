@@ -1,741 +1,758 @@
 """
-Validación de líneas de costa mediante transectos.
+Descarga de productos Sentinel-2 desde Copernicus Data Space Ecosystem.
 
-Dependencias:
-    pip install numpy pandas matplotlib shapely pyproj scipy
+Requiere:
+    pip install requests
 
-Utiliza shoreline_utils.py del proyecto.
+Credenciales (cuenta gratuita en https://dataspace.copernicus.eu):
+    Ya no están escritas en el código. Se leen, por orden, de:
+      1. Variables de entorno CDSE_USER y CDSE_PASSWORD.
+      2. Un archivo local .cdse_credentials junto a este script, con
+         dos líneas: usuario y contraseña (está en .gitignore).
+      3. Si no hay ninguna y se ejecuta en una terminal, se piden
+         por teclado (la contraseña no se muestra).
+    El panel de control las pasa por variables de entorno.
 
-Entrada estimada:
-    CSV con columnas:
-        date,x,y
+Compatibilidad con el flujo anterior:
+    python descarga_copernicus.py --inicio 2026-06-01 --fin 2026-09-30
 
-    Opcionalmente:
-        case
-        point_id
+Calibración en Shadnagar:
+    python descarga_copernicus.py --zona shadnagar \
+        --inicio 2024-01-01 --fin 2026-11-20 \
+        --nivel AMBOS --num-fechas 10 --exigir-todos \
+        --nubosidad 10 --solo-listar
 
-    - case permite separar original/distorsionado/corregido.
-    - point_id permite indicar el orden de los puntos.
-    - Sin point_id, se utiliza la ordenación de shoreline_utils.
+Quitar --solo-listar para descargar.
 
-Referencia:
-    CSV con las dos primeras columnas X e Y.
-    Se admiten comas, tabulaciones o espacios y una cabecera.
-    Sus puntos deben estar ordenados a lo largo de la costa.
-
-IMPORTANTE:
-    Los CSV no contienen necesariamente información del CRS.
-    --crs declara el CRS común de ambos archivos:
-    no transforma ni verifica automáticamente sus coordenadas.
-
-Uso habitual:
-    python error_estimator.py \
-        -p costa_principal \
-        -g ruta/referencias \
-        -d 2017-06-01 \
-        --crs EPSG:32631
-
-Con un CSV estimado específico:
-    python error_estimator.py \
-        -p costa_principal \
-        --estimated-csv ruta/original.csv \
-        --reference-file ruta/referencia.csv \
-        -d 2017-06-01 \
-        --case original \
-        --crs EPSG:32631 \
-        --no-plot
+Importante:
+- El filtro de nubosidad corresponde a toda la escena.
+- La selección automática no garantiza que el objetivo esté despejado.
+- El área de búsqueda de Shadnagar NO es el recorte final de análisis.
+- Este archivo descarga datos; no calcula RMSE ni aplica calibraciones.
 """
 
 import argparse
+import csv
+import getpass
 import json
+import math
+import os
 import re
-from datetime import datetime
+import sys
+from collections import defaultdict
+from datetime import date
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
-from pyproj import CRS
-from shapely.geometry import LineString, Point
-
-import shoreline_utils as utils
-
-
-SPATIAL_SPACING = 10.0
-TRANSECT_LENGTH = 100.0
+import requests
 
 
 # ---------------------------------------------------------------------------
-# Comprobaciones y lectura
+# Configuración
 # ---------------------------------------------------------------------------
 
-def validate_metric_crs(crs):
-    parsed = CRS.from_user_input(crs)
+# Las rutas parten de la carpeta del script, no del directorio de trabajo.
+BASE_DIR = Path(__file__).resolve().parent
 
-    if not parsed.is_projected:
-        raise ValueError(
-            "El CRS debe ser proyectado, no latitud/longitud."
-        )
+NOMBRE_PROYECTO = "costa_principal"
+ARCHIVO_CREDENCIALES = BASE_DIR / ".cdse_credentials"
 
-    axes = parsed.axis_info[:2]
+CARPETA_ENTRADA = BASE_DIR / "Imagenes" / "zips_entrada"
+CARPETA_PROCESADOS = BASE_DIR / "Imagenes" / "zips_procesados"
+CARPETA_CALIBRACION = BASE_DIR / "Imagenes" / "calibracion"
 
-    if len(axes) != 2:
-        raise ValueError(
-            "No se pudieron comprobar las unidades del CRS."
-        )
+NUBOSIDAD_MAX_ESCENA = 40.0
 
-    for axis in axes:
-        factor = axis.unit_conversion_factor
+SHADNAGAR_LAT = 17.034261
+SHADNAGAR_LON = 78.183078
 
-        if (
-            factor is None
-            or not np.isclose(
-                factor, 1.0, rtol=0, atol=1e-12
-            )
-        ):
-            raise ValueError(
-                "El CRS debe utilizar metros."
-            )
+URL_TOKEN = (
+    "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/"
+    "protocol/openid-connect/token"
+)
+URL_CATALOGO = "https://catalogue.dataspace.copernicus.eu/odata/v1/Products"
+URL_DESCARGA = (
+    "https://download.dataspace.copernicus.eu/"
+    "odata/v1/Products({id})/$value"
+)
 
-    return parsed
+TIPOS = {"L1C": "S2MSI1C", "L2A": "S2MSI2A"}
 
-
-def closest_ground_truth_file(ground_truth_dir, target_date):
-    base = Path(ground_truth_dir).expanduser().resolve()
-
-    if not base.is_dir():
-        raise NotADirectoryError(
-            f"No existe la carpeta de referencias: {base}"
-        )
-
-    dated_files = []
-
-    for csv_file in sorted(base.glob("*.csv")):
-        file_date = utils.extract_date(csv_file.name)
-
-        if file_date is not None:
-            dated_files.append((file_date, csv_file))
-
-    if not dated_files:
-        raise FileNotFoundError(
-            f"No hay CSV con fecha reconocible en {base}."
-        )
-
-    return min(
-        dated_files,
-        key=lambda row: (
-            abs((row[0] - target_date).days),
-            row[0],
-            row[1].name,
-        ),
-    )
+PATRON_NOMBRE = re.compile(
+    r"^(S2[ABC])_MSIL(1C|2A)_(\d{8}T\d{6})_"
+    r"N(\d+)_R(\d+)_T([A-Z0-9]{5})_(\d{8}T\d{6})"
+)
 
 
-def read_reference_coords(csv_path):
-    """
-    Lee las dos primeras columnas numéricas sin alterar
-    el orden original.
+# ---------------------------------------------------------------------------
+# Área de búsqueda
+# ---------------------------------------------------------------------------
 
-    Elimina solo duplicados consecutivos.
-    """
-    df = pd.read_csv(
-        csv_path,
-        sep=r"\s+|,",
-        engine="python",
-        comment="%",
-        header=None,
-        usecols=[0, 1],
-    )
+def geojson_a_wkt(ruta):
+    """Lee un Polygon desde una geometría, Feature o FeatureCollection."""
+    with open(ruta, encoding="utf-8") as f:
+        contenido = json.load(f)
 
-    df = df.apply(
-        pd.to_numeric, errors="coerce"
-    )
+    tipo = contenido.get("type")
 
-    coords = df.to_numpy(dtype=float)
-    coords = coords[
-        np.isfinite(coords).all(axis=1)
-    ]
-
-    if len(coords) < 2:
-        raise ValueError(
-            "La referencia necesita al menos dos puntos válidos."
-        )
-
-    keep = np.concatenate([
-        [True],
-        np.any(np.diff(coords, axis=0) != 0, axis=1),
-    ])
-
-    coords = coords[keep]
-
-    if len(coords) < 2:
-        raise ValueError(
-            "La referencia no contiene dos puntos distintos."
-        )
-
-    return coords
-
-
-def read_estimated_line(
-    csv_path,
-    target_date,
-    case,
-    ordered=False,
-):
-    df = pd.read_csv(csv_path)
-
-    required = {"date", "x", "y"}
-
-    if not required.issubset(df.columns):
-        raise ValueError(
-            f"{csv_path} debe contener date, x e y."
-        )
-
-    normalized_dates = pd.to_datetime(
-        df["date"], errors="coerce", utc=True
-    ).dt.strftime("%Y-%m-%d")
-
-    df = df.loc[
-        normalized_dates == target_date
-    ].copy()
-
-    if df.empty:
-        raise ValueError(
-            f"No hay puntos para {target_date} en {csv_path}."
-        )
-
-    if "case" in df.columns:
-        df = df.loc[
-            df["case"].astype(str) == case
-        ].copy()
-
-        if df.empty:
-            raise ValueError(
-                f"No hay puntos del caso '{case}' "
-                f"para {target_date}."
-            )
-
-    # Evita mezclar productos si el CSV los identifica.
-    for column in ("product_id", "product", "source_file"):
-        if (
-            column in df.columns
-            and df[column].nunique(dropna=False) > 1
-        ):
-            raise ValueError(
-                f"Hay varios valores de '{column}' "
-                "en la selección. Utiliza un CSV separado "
-                "para cada línea que quieras evaluar."
-            )
-
-    if "point_id" in df.columns:
-        df["point_id"] = pd.to_numeric(
-            df["point_id"], errors="raise"
-        )
-
-        if df["point_id"].duplicated().any():
-            raise ValueError(
-                "Hay point_id duplicados. "
-                "Comprueba que no se han mezclado varias líneas."
-            )
-
-        df = df.sort_values("point_id")
-        ordered = True
-
-    df["x"] = pd.to_numeric(
-        df["x"], errors="coerce"
-    )
-    df["y"] = pd.to_numeric(
-        df["y"], errors="coerce"
-    )
-
-    coords = df[["x", "y"]].to_numpy(dtype=float)
-    coords = coords[
-        np.isfinite(coords).all(axis=1)
-    ]
-
-    if len(coords) < 2:
-        raise ValueError(
-            "La costa estimada necesita al menos dos puntos."
-        )
-
-    if ordered:
-        keep = np.concatenate([
-            [True],
-            np.any(np.diff(coords, axis=0) != 0, axis=1),
-        ])
-        coords = coords[keep]
+    if tipo == "FeatureCollection":
+        features = contenido.get("features", [])
+        if not features:
+            raise ValueError("El GeoJSON no contiene elementos.")
+        geometria = features[0]["geometry"]
+    elif tipo == "Feature":
+        geometria = contenido["geometry"]
     else:
-        # Elimina duplicados sin cambiar el orden de primera aparición.
-        _, indices = np.unique(
-            coords, axis=0, return_index=True
+        geometria = contenido
+
+    if not geometria or geometria.get("type") != "Polygon":
+        raise ValueError("El GeoJSON debe contener un Polygon.")
+
+    anillos = []
+    for anillo in geometria["coordinates"]:
+        puntos = [tuple(p[:2]) for p in anillo]
+        if len(puntos) < 3:
+            raise ValueError("El polígono tiene un anillo no válido.")
+        if puntos[0] != puntos[-1]:
+            puntos.append(puntos[0])
+
+        texto = ", ".join(
+            f"{lon:.8f} {lat:.8f}" for lon, lat in puntos
         )
-        coords = coords[np.sort(indices)]
+        anillos.append(f"({texto})")
 
-    if len(coords) < 2:
-        raise ValueError(
-            "La costa estimada no contiene dos puntos distintos."
-        )
-
-    return utils.build_ordered_linestring(
-        coords, ordered=ordered
-    )
+    return f"POLYGON({', '.join(anillos)})"
 
 
-# ---------------------------------------------------------------------------
-# Transectos e intersecciones
-# ---------------------------------------------------------------------------
-
-def build_transects(reference_line, spacing, length):
-    if reference_line.length <= 0:
-        raise ValueError(
-            "La referencia tiene longitud nula."
-        )
-
-    positions = np.arange(
-        0.0,
-        reference_line.length,
-        spacing,
-    )
-
-    transects = []
-
-    # Se aproxima la tangente con dos puntos próximos
-    # sobre la referencia, sin aplicar una spline.
-    delta = min(
-        spacing / 2.0,
-        reference_line.length / 2.0,
-    )
-
-    for transect_id, distance_along in enumerate(positions):
-        center = reference_line.interpolate(
-            float(distance_along)
-        )
-
-        before = reference_line.interpolate(
-            max(0.0, distance_along - delta)
-        )
-        after = reference_line.interpolate(
-            min(
-                reference_line.length,
-                distance_along + delta,
-            )
-        )
-
-        tangent = np.array([
-            after.x - before.x,
-            after.y - before.y,
-        ])
-
-        norm = np.linalg.norm(tangent)
-
-        if norm <= 1e-12:
-            continue
-
-        normal = np.array([
-            -tangent[1], tangent[0]
-        ]) / norm
-
-        origin = np.array([
-            center.x, center.y
-        ])
-
-        start = origin - normal * length / 2.0
-        end = origin + normal * length / 2.0
-
-        transects.append({
-            "transect_id": transect_id,
-            "chainage_m": float(distance_along),
-            "reference_x": center.x,
-            "reference_y": center.y,
-            "normal": normal,
-            "geometry": LineString([start, end]),
-        })
-
-    if not transects:
-        raise ValueError(
-            "No se pudieron generar transectos válidos."
-        )
-
-    return transects
-
-
-def intersection_points(geometry):
+def wkt_shadnagar(semilado_m=500):
     """
-    Devuelve puntos de intersección.
-
-    Los solapamientos lineales se consideran ambiguos:
-    no se convierten artificialmente en una distancia puntual.
+    Caja aproximada para buscar escenas alrededor del objetivo.
+    No sustituye al recorte posterior en coordenadas proyectadas.
     """
-    if geometry.is_empty:
-        return [], False
+    delta_lat = semilado_m / 111320.0
+    delta_lon = semilado_m / (
+        111320.0 * math.cos(math.radians(SHADNAGAR_LAT))
+    )
 
-    if isinstance(geometry, Point):
-        return [geometry], False
+    oeste = SHADNAGAR_LON - delta_lon
+    este = SHADNAGAR_LON + delta_lon
+    sur = SHADNAGAR_LAT - delta_lat
+    norte = SHADNAGAR_LAT + delta_lat
 
-    if geometry.geom_type in {
-        "MultiPoint", "GeometryCollection"
-    }:
-        points = []
-        overlap = False
-
-        for part in geometry.geoms:
-            part_points, part_overlap = intersection_points(part)
-            points.extend(part_points)
-            overlap = overlap or part_overlap
-
-        return points, overlap
-
-    return [], True
-
-
-def signed_intersection_distance(
-    intersection,
-    px,
-    py,
-    normal,
-):
-    points, overlap = intersection_points(intersection)
-
-    if overlap or not points:
-        return np.nan
-
-    origin = np.array([px, py], dtype=float)
-
-    signed_distances = [
-        float(np.dot(
-            np.array([point.x, point.y]) - origin,
-            normal,
-        ))
-        for point in points
-    ]
-
-    return min(signed_distances, key=abs)
+    return (
+        f"POLYGON(({oeste:.8f} {sur:.8f}, "
+        f"{este:.8f} {sur:.8f}, "
+        f"{este:.8f} {norte:.8f}, "
+        f"{oeste:.8f} {norte:.8f}, "
+        f"{oeste:.8f} {sur:.8f}))"
+    )
 
 
 # ---------------------------------------------------------------------------
-# Evaluación principal
+# Catálogo y metadatos
 # ---------------------------------------------------------------------------
 
-def main(
-    project,
-    ground_truth,
-    date,
-    show_plot=True,
-    estimated_csv=None,
-    reference_file=None,
-    case="original",
-    crs=None,
-    spacing=SPATIAL_SPACING,
-    transect_length=TRANSECT_LENGTH,
-    ordered=False,
-):
-    if crs is None:
-        raise ValueError(
-            "Indica el CRS común con --crs."
-        )
+def buscar_productos(wkt, inicio, fin, nubosidad_max, nivel="L2A"):
+    tipo = TIPOS[nivel]
 
-    metric_crs = validate_metric_crs(crs)
-
-    if (
-        not np.isfinite(spacing)
-        or not np.isfinite(transect_length)
-        or spacing <= 0
-        or transect_length <= 0
-    ):
-        raise ValueError(
-            "El espaciado y la longitud deben ser positivos y finitos."
-        )
-
-    target_date = datetime.strptime(
-        date, "%Y-%m-%d"
-    ).date()
-
-    project_dir = utils.project_path(project)
-
-    output_dir = (
-        project_dir
-        / "output"
-        / "estimated_error"
-    )
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    csv_path = (
-        Path(estimated_csv)
-        if estimated_csv
-        else (
-            project_dir
-            / "output"
-            / "estimated_waterbodies_edges"
-            / "all_shorelines.csv"
-        )
+    filtro = (
+        "Collection/Name eq 'SENTINEL-2' "
+        f"and OData.CSC.Intersects(area=geography'SRID=4326;{wkt}') "
+        f"and ContentDate/Start ge {inicio}T00:00:00.000Z "
+        f"and ContentDate/Start le {fin}T23:59:59.999Z "
+        "and Attributes/OData.CSC.StringAttribute/any(a:"
+        "a/Name eq 'productType' "
+        f"and a/OData.CSC.StringAttribute/Value eq '{tipo}') "
+        "and Attributes/OData.CSC.DoubleAttribute/any(a:"
+        "a/Name eq 'cloudCover' "
+        f"and a/OData.CSC.DoubleAttribute/Value le {nubosidad_max})"
     )
 
-    line = read_estimated_line(
-        csv_path,
-        date,
-        case,
-        ordered=ordered,
-    )
-
-    if reference_file:
-        gt_path = Path(reference_file)
-        reference_date = utils.extract_date(
-            gt_path.name
-        )
-    else:
-        if not ground_truth:
-            raise ValueError(
-                "Indica --ground-truth o --reference-file."
-            )
-
-        reference_date, gt_path = closest_ground_truth_file(
-            ground_truth, target_date
-        )
-
-    reference_coords = read_reference_coords(
-        gt_path
-    )
-    reference_line = LineString(
-        reference_coords
-    )
-
-    transects = build_transects(
-        reference_line,
-        spacing,
-        transect_length,
-    )
-
-    results = []
-
-    for transect in transects:
-        intersection = transect["geometry"].intersection(line)
-
-        distance = signed_intersection_distance(
-            intersection,
-            transect["reference_x"],
-            transect["reference_y"],
-            transect["normal"],
-        )
-
-        results.append({
-            "date": date,
-            "case": case,
-            "transect_id": transect["transect_id"],
-            "chainage_m": transect["chainage_m"],
-            "reference_x": transect["reference_x"],
-            "reference_y": transect["reference_y"],
-            "distance_m": distance,
-        })
-
-    distance_df = pd.DataFrame(results)
-    valid = distance_df["distance_m"].dropna()
-
-    safe_case = re.sub(
-        r"[^A-Za-z0-9_-]+", "_", case
-    ).strip("_") or "caso"
-
-    prefix = f"{date}_{safe_case}"
-
-    distance_path = (
-        output_dir / f"{prefix}_distances.csv"
-    )
-    distance_df.to_csv(
-        distance_path, index=False
-    )
-
-    summary = {
-        "date": date,
-        "case": case,
-        "estimated_csv": str(csv_path.resolve()),
-        "reference_csv": str(gt_path.resolve()),
-        "reference_date": (
-            reference_date.isoformat()
-            if reference_date else None
-        ),
-        "reference_date_difference_days": (
-            (target_date - reference_date).days
-            if reference_date else None
-        ),
-        "declared_common_crs": metric_crs.to_string(),
-        "spacing_m": spacing,
-        "transect_length_m": transect_length,
-        "method": "reference_polyline_local_tangent",
-        "n_transects": len(distance_df),
-        "n_valid": len(valid),
-        "rmse_m": (
-            float(np.sqrt(np.mean(valid.to_numpy() ** 2)))
-            if len(valid) else None
-        ),
-        "mean_signed_distance_m": (
-            float(valid.mean())
-            if len(valid) else None
-        ),
-        "mae_m": (
-            float(valid.abs().mean())
-            if len(valid) else None
-        ),
-        "sign_note": (
-            "El signo depende del orden de la referencia; "
-            "no identifica automáticamente erosión/acreción."
-        ),
+    params = {
+        "$filter": filtro,
+        "$orderby": "ContentDate/Start asc",
+        "$expand": "Attributes",
+        "$top": 100,
     }
 
-    summary_path = (
-        output_dir / f"{prefix}_summary.json"
-    )
+    productos = []
+    url = URL_CATALOGO
 
-    with summary_path.open(
-        "w", encoding="utf-8"
-    ) as file:
-        json.dump(
-            summary,
-            file,
-            indent=2,
-            ensure_ascii=False,
-            allow_nan=False,
-        )
+    while url:
+        respuesta = requests.get(url, params=params, timeout=60)
+        respuesta.raise_for_status()
+        datos = respuesta.json()
+        productos.extend(datos["value"])
+        url = datos.get("@odata.nextLink")
+        params = None
 
-    # Importación diferida para permitir --no-plot sin interfaz gráfica.
-    import matplotlib
+    return productos
 
-    if not show_plot:
-        matplotlib.use("Agg")
 
-    import matplotlib.pyplot as plt
+def metadatos(producto):
+    nombre = producto["Name"]
+    coincidencia = PATRON_NOMBRE.match(nombre)
 
-    fig, ax = plt.subplots(figsize=(12, 8))
-
-    ax.plot(
-        *reference_line.xy,
-        "b-",
-        label="Referencia",
-    )
-    ax.plot(
-        *line.xy,
-        "k--",
-        label=f"Estimada: {case}",
-    )
-
-    for transect in transects:
-        ax.plot(
-            *transect["geometry"].xy,
-            "g-",
-            alpha=0.25,
-        )
-
-    ax.set_title(
-        f"Validación de costa: {date} — {case}"
-    )
-    ax.set_xlabel("X (m)")
-    ax.set_ylabel("Y (m)")
-    ax.set_aspect("equal", adjustable="datalim")
-    ax.grid(True)
-    ax.legend()
-
-    fig.savefig(
-        output_dir / f"{prefix}_validation.png",
-        dpi=150,
-        bbox_inches="tight",
-    )
-
-    if show_plot:
-        plt.show()
-
-    plt.close(fig)
-
-    print(f"Referencia: {gt_path}")
-    print(f"Fecha de referencia: {reference_date}")
-    print(
-        f"Transectos válidos: {len(valid)}/{len(distance_df)}"
-    )
-
-    if len(valid) == 0:
+    if not coincidencia:
         raise ValueError(
-            "No hay intersecciones válidas para calcular el RMSE. "
-            "Se han guardado los archivos de diagnóstico. "
-            "Revisa CRS, referencia, orden y longitud de transectos."
+            f"Nombre Sentinel-2 no reconocido: {nombre}"
         )
 
-    print(f"RMSE: {summary['rmse_m']:.3f} m")
-    print(f"Distancias: {distance_path}")
-    print(f"Resumen: {summary_path}")
+    satelite, nivel, instante, baseline, orbita, tesela, generado = (
+        coincidencia.groups()
+    )
 
-    return summary
+    nubes = None
+    for atributo in producto.get("Attributes", []):
+        if atributo.get("Name") == "cloudCover":
+            nubes = float(atributo["Value"])
+            break
+
+    return {
+        "satelite": satelite,
+        "nivel": f"L{nivel}",
+        "instante": instante,
+        "fecha": (
+            f"{instante[:4]}-{instante[4:6]}-{instante[6:8]}"
+        ),
+        "baseline": int(baseline),
+        "orbita": orbita,
+        "tesela": tesela,
+        "generado": generado,
+        "nubosidad": nubes,
+    }
+
+
+def clave_escena(producto):
+    m = metadatos(producto)
+    return (
+        m["satelite"],
+        m["instante"],
+        m["orbita"],
+        m["tesela"],
+    )
+
+
+def deduplicar(productos):
+    """Conserva una versión por escena y nivel."""
+    elegidos = {}
+
+    for producto in productos:
+        m = metadatos(producto)
+        clave = (clave_escena(producto), m["nivel"])
+        anterior = elegidos.get(clave)
+
+        if anterior is None:
+            elegidos[clave] = producto
+            continue
+
+        ma = metadatos(anterior)
+        if (m["baseline"], m["generado"]) > (
+            ma["baseline"], ma["generado"]
+        ):
+            elegidos[clave] = producto
+
+    return list(elegidos.values())
+
+
+def crear_grupos(productos, exigir_parejas=False):
+    """Cada grupo contiene una escena y uno o dos niveles."""
+    grupos = defaultdict(list)
+
+    for producto in productos:
+        grupos[clave_escena(producto)].append(producto)
+
+    resultado = []
+    for grupo in grupos.values():
+        niveles = {metadatos(p)["nivel"] for p in grupo}
+        if exigir_parejas and niveles != {"L1C", "L2A"}:
+            continue
+        resultado.append(grupo)
+
+    return resultado
+
+
+def calidad_grupo(grupo):
+    nubes = [
+        metadatos(p)["nubosidad"]
+        for p in grupo
+        if metadatos(p)["nubosidad"] is not None
+    ]
+    return (
+        max(nubes) if nubes else float("inf"),
+        metadatos(grupo[0])["instante"],
+        metadatos(grupo[0])["tesela"],
+    )
+
+
+def seleccionar_fechas(grupos, numero, satelites, exigir_todos):
+    """
+    Selecciona una escena por día, priorizando baja nubosidad.
+    Si se exige cobertura de satélites, la garantiza primero.
+    """
+    grupos = [
+        g for g in grupos
+        if metadatos(g[0])["satelite"] in satelites
+    ]
+
+    if numero is None:
+        presentes = {metadatos(g[0])["satelite"] for g in grupos}
+        if exigir_todos and not set(satelites).issubset(presentes):
+            faltan = set(satelites) - presentes
+            raise ValueError(f"Faltan satélites: {sorted(faltan)}")
+        return sorted(
+            grupos, key=lambda g: metadatos(g[0])["instante"]
+        )
+
+    if exigir_todos and numero < len(satelites):
+        raise ValueError(
+            "--num-fechas debe permitir al menos una fecha por satélite."
+        )
+
+    grupos = sorted(grupos, key=calidad_grupo)
+    seleccion = []
+    fechas_usadas = set()
+
+    if exigir_todos:
+        candidatos = {
+            sat: [
+                g for g in grupos
+                if metadatos(g[0])["satelite"] == sat
+            ]
+            for sat in satelites
+        }
+
+        # Backtracking para garantizar días distintos entre satélites.
+        orden = sorted(satelites, key=lambda s: len(candidatos[s]))
+
+        def asignar(indice):
+            if indice == len(orden):
+                return True
+
+            for grupo in candidatos[orden[indice]]:
+                fecha = metadatos(grupo[0])["fecha"]
+                if fecha in fechas_usadas:
+                    continue
+
+                seleccion.append(grupo)
+                fechas_usadas.add(fecha)
+
+                if asignar(indice + 1):
+                    return True
+
+                seleccion.pop()
+                fechas_usadas.remove(fecha)
+
+            return False
+
+        if not asignar(0):
+            raise ValueError(
+                "No hay combinación de fechas distintas que incluya "
+                "todos los satélites solicitados. Amplía el intervalo "
+                "o revisa el filtro de nubosidad."
+            )
+
+    for grupo in grupos:
+        if len(seleccion) >= numero:
+            break
+
+        fecha = metadatos(grupo[0])["fecha"]
+        if fecha not in fechas_usadas:
+            seleccion.append(grupo)
+            fechas_usadas.add(fecha)
+
+    if len(seleccion) < numero:
+        raise ValueError(
+            f"Se solicitaron {numero} fechas distintas, pero solo "
+            f"se pueden seleccionar {len(seleccion)}."
+        )
+
+    return sorted(
+        seleccion, key=lambda g: metadatos(g[0])["instante"]
+    )
 
 
 # ---------------------------------------------------------------------------
-# Terminal
+# Autenticación y descarga
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Validar costas mediante transectos."
-    )
+def obtener_credenciales():
+    """
+    Devuelve (usuario, password) o (None, None) si no hay credenciales.
+    Orden: variables de entorno, archivo local, petición por teclado.
+    """
+    usuario = os.environ.get("CDSE_USER")
+    password = os.environ.get("CDSE_PASSWORD")
 
-    parser.add_argument(
-        "-p", "--project", required=True
-    )
-    parser.add_argument(
-        "-g", "--ground-truth",
-        help="Carpeta con referencias fechadas."
-    )
-    parser.add_argument(
-        "--reference-file",
-        help="Referencia concreta; tiene prioridad sobre -g."
-    )
-    parser.add_argument(
-        "-d", "--date", required=True,
-        help="Fecha YYYY-MM-DD."
-    )
-    parser.add_argument(
-        "--estimated-csv",
-        help="CSV estimado; por defecto all_shorelines.csv."
-    )
-    parser.add_argument(
-        "--case", default="original",
-        help="Caso evaluado; también filtra la columna case si existe."
-    )
-    parser.add_argument(
-        "--crs", required=True,
-        help="CRS común real de ambos CSV, por ejemplo EPSG:32631."
-    )
-    parser.add_argument(
-        "--spacing",
-        type=float,
-        default=SPATIAL_SPACING,
-    )
-    parser.add_argument(
-        "--transect-length",
-        type=float,
-        default=TRANSECT_LENGTH,
-    )
-    parser.add_argument(
-        "--ordered",
-        action="store_true",
-        help="Los puntos estimados ya siguen el recorrido de la costa."
-    )
-    parser.add_argument(
-        "--no-plot",
-        action="store_true",
-    )
+    if usuario and password:
+        return usuario, password
 
-    args = parser.parse_args()
+    if ARCHIVO_CREDENCIALES.is_file():
+        lineas = [
+            linea.strip()
+            for linea in ARCHIVO_CREDENCIALES.read_text(
+                encoding="utf-8"
+            ).splitlines()
+            if linea.strip()
+        ]
+
+        if len(lineas) >= 2:
+            return lineas[0], lineas[1]
+
+    if sys.stdin is not None and sys.stdin.isatty():
+        usuario = input("Usuario CDSE (correo): ").strip()
+        password = getpass.getpass("Contraseña CDSE: ")
+
+        if usuario and password:
+            return usuario, password
+
+    return None, None
+
+
+def obtener_token(usuario, password):
+    respuesta = requests.post(
+        URL_TOKEN,
+        data={
+            "client_id": "cdse-public",
+            "grant_type": "password",
+            "username": usuario,
+            "password": password,
+        },
+        timeout=60,
+    )
+    respuesta.raise_for_status()
+    return respuesta.json()["access_token"]
+
+
+def descargar_producto(producto, destino, usuario, password):
+    destino = Path(destino)
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    parcial = Path(str(destino) + ".part")
+
+    token = obtener_token(usuario, password)
+    url = URL_DESCARGA.format(id=producto["Id"])
+
+    with requests.get(
+        url,
+        headers={"Authorization": f"Bearer {token}"},
+        stream=True,
+        timeout=(30, 180),
+    ) as respuesta:
+        respuesta.raise_for_status()
+        recibidos = 0
+
+        with parcial.open("wb") as archivo:
+            for bloque in respuesta.iter_content(
+                chunk_size=8 * 1024 * 1024
+            ):
+                if bloque:
+                    archivo.write(bloque)
+                    recibidos += len(bloque)
+
+    if recibidos == 0:
+        raise IOError("La descarga está vacía.")
+
+    esperado = int(producto.get("ContentLength") or 0)
+    if esperado and recibidos != esperado:
+        raise IOError(
+            f"Tamaño inesperado: {recibidos} bytes; "
+            f"el catálogo indica {esperado}. Se conserva el .part."
+        )
+
+    os.replace(parcial, destino)
+
+
+# ---------------------------------------------------------------------------
+# Manifiesto
+# ---------------------------------------------------------------------------
+
+CAMPOS_CSV = [
+    "id", "nombre", "fecha", "instante", "satelite", "nivel",
+    "tesela", "orbita", "baseline", "nubosidad",
+    "bytes_catalogo", "ruta", "estado", "error",
+]
+
+
+def guardar_manifiesto(filas, ruta):
+    ruta = Path(ruta)
+    ruta.parent.mkdir(parents=True, exist_ok=True)
+
+    with ruta.open("w", newline="", encoding="utf-8") as archivo:
+        escritor = csv.DictWriter(archivo, fieldnames=CAMPOS_CSV)
+        escritor.writeheader()
+        escritor.writerows(filas)
+
+
+# ---------------------------------------------------------------------------
+# Programa principal
+# ---------------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Descarga Sentinel-2 para costa y calibración."
+    )
+    ap.add_argument("--inicio", required=True, help="YYYY-MM-DD")
+    ap.add_argument(
+        "--fin", default=date.today().isoformat(), help="YYYY-MM-DD"
+    )
+    ap.add_argument(
+        "--zona", choices=["costa", "shadnagar"], default="costa"
+    )
+    ap.add_argument(
+        "--proyecto", default=NOMBRE_PROYECTO,
+        help="Proyecto cuyo polygon.geojson define el área (modo costa)."
+    )
+    ap.add_argument(
+        "--geojson",
+        help="GeoJSON propio; tiene prioridad sobre --zona."
+    )
+    ap.add_argument(
+        "--nivel", choices=["L1C", "L2A", "AMBOS"], default="L2A"
+    )
+    ap.add_argument(
+        "--nubosidad", type=float, default=NUBOSIDAD_MAX_ESCENA
+    )
+    ap.add_argument(
+        "--satelites", nargs="+",
+        choices=["S2A", "S2B", "S2C"],
+        default=["S2A", "S2B", "S2C"],
+    )
+    ap.add_argument(
+        "--num-fechas", type=int,
+        help="Seleccionar exactamente N días distintos."
+    )
+    ap.add_argument(
+        "--exigir-todos", action="store_true",
+        help="Exigir presencia de todos los satélites solicitados."
+    )
+    ap.add_argument("--destino", help="Carpeta de salida personalizada.")
+    ap.add_argument("--manifiesto", help="Ruta del manifiesto CSV.")
+    ap.add_argument("--solo-listar", action="store_true")
+    args = ap.parse_args()
 
     try:
-        main(
-            project=args.project,
-            ground_truth=args.ground_truth,
-            date=args.date,
-            show_plot=not args.no_plot,
-            estimated_csv=args.estimated_csv,
-            reference_file=args.reference_file,
-            case=args.case,
-            crs=args.crs,
-            spacing=args.spacing,
-            transect_length=args.transect_length,
-            ordered=args.ordered,
+        inicio = date.fromisoformat(args.inicio)
+        fin = date.fromisoformat(args.fin)
+    except ValueError:
+        ap.error("Las fechas deben tener formato YYYY-MM-DD.")
+
+    if inicio > fin:
+        ap.error("--inicio no puede ser posterior a --fin.")
+    if not 0 <= args.nubosidad <= 100:
+        ap.error("--nubosidad debe estar entre 0 y 100.")
+    if args.num_fechas is not None and args.num_fechas <= 0:
+        ap.error("--num-fechas debe ser mayor que cero.")
+
+    args.satelites = list(dict.fromkeys(args.satelites))
+
+    usuario = password = None
+
+    if not args.solo_listar:
+        usuario, password = obtener_credenciales()
+
+        if not (usuario and password):
+            ap.error(
+                "Faltan las credenciales de CDSE. Define CDSE_USER y "
+                "CDSE_PASSWORD, crea .cdse_credentials o ejecuta desde "
+                "una terminal para introducirlas."
+            )
+
+    if args.geojson:
+        ruta_geojson = Path(args.geojson)
+    else:
+        ruta_geojson = (
+            BASE_DIR / "projects" / args.proyecto
+            / "input" / "polygon.geojson"
         )
-    except (ValueError, OSError) as error:
-        parser.exit(
-            status=1,
-            message=f"Error: {error}\n",
+
+    if args.geojson:
+        wkt = geojson_a_wkt(ruta_geojson)
+    elif args.zona == "shadnagar":
+        wkt = wkt_shadnagar()
+    else:
+        if not ruta_geojson.is_file():
+            raise SystemExit(
+                f"No existe el polígono del proyecto: {ruta_geojson}"
+            )
+        wkt = geojson_a_wkt(ruta_geojson)
+
+    # Solo el modo costa/L2A original conserva la salida antigua.
+    modo_original = (
+        args.zona == "costa"
+        and args.geojson is None
+        and args.nivel == "L2A"
+        and args.destino is None
+    )
+
+    if args.destino:
+        carpeta = Path(args.destino)
+    elif modo_original:
+        carpeta = Path(CARPETA_ENTRADA)
+    else:
+        carpeta = Path(CARPETA_CALIBRACION) / args.zona
+
+    niveles = (
+        ["L1C", "L2A"] if args.nivel == "AMBOS"
+        else [args.nivel]
+    )
+
+    productos = []
+    for nivel in niveles:
+        try:
+            encontrados = buscar_productos(
+                wkt, args.inicio, args.fin, args.nubosidad, nivel
+            )
+        except requests.RequestException as error:
+            raise SystemExit(
+                f"No se pudo consultar el catálogo de Copernicus: {error}"
+            )
+        print(f"{nivel}: {len(encontrados)} productos encontrados.")
+        productos.extend(encontrados)
+
+    # No seleccionar productos que no están disponibles para descarga.
+    disponibles = [
+        p for p in productos if p.get("Online", True)
+    ]
+    archivados = len(productos) - len(disponibles)
+
+    if archivados:
+        print(
+            f"Aviso: {archivados} productos están archivados "
+            "(offline) y se omiten; no se pueden descargar directamente."
         )
+
+    productos = deduplicar(disponibles)
+
+    grupos = crear_grupos(
+        productos, exigir_parejas=args.nivel == "AMBOS"
+    )
+
+    try:
+        grupos = seleccionar_fechas(
+            grupos,
+            args.num_fechas,
+            args.satelites,
+            args.exigir_todos,
+        )
+    except ValueError as error:
+        raise SystemExit(str(error))
+
+    seleccionados = [
+        p
+        for grupo in grupos
+        for p in sorted(
+            grupo, key=lambda p: metadatos(p)["nivel"]
+        )
+    ]
+
+    if not seleccionados:
+        raise SystemExit(
+            "No hay productos que cumplan los criterios solicitados."
+        )
+
+    fechas = {metadatos(p)["fecha"] for p in seleccionados}
+    sats = {metadatos(p)["satelite"] for p in seleccionados}
+
+    print(
+        f"\nSelección: {len(seleccionados)} productos, "
+        f"{len(fechas)} fechas distintas."
+    )
+    print(f"Satélites: {', '.join(sorted(sats))}")
+    print(
+        "Aviso: revisar visualmente la nubosidad sobre el objetivo "
+        "antes de dar por válidas las fechas."
+    )
+
+    ruta_manifiesto = (
+        Path(args.manifiesto)
+        if args.manifiesto
+        else carpeta / (
+            f"manifiesto_{args.nivel}_{args.inicio}_{args.fin}.csv"
+        )
+    )
+
+    filas = []
+
+    for producto in seleccionados:
+        m = metadatos(producto)
+        nombre_zip = (
+            producto["Name"].removesuffix(".SAFE") + ".zip"
+        )
+
+        destino = (
+            carpeta / nombre_zip
+            if modo_original
+            else carpeta / m["nivel"] / nombre_zip
+        )
+
+        fila = {
+            "id": producto["Id"],
+            "nombre": producto["Name"],
+            **{
+                campo: m[campo]
+                for campo in [
+                    "fecha", "instante", "satelite", "nivel",
+                    "tesela", "orbita", "baseline", "nubosidad",
+                ]
+            },
+            "bytes_catalogo": producto.get("ContentLength", ""),
+            "ruta": str(destino),
+            "estado": "seleccionado",
+            "error": "",
+        }
+        filas.append(fila)
+
+        print(
+            f"\n{m['fecha']} | {m['satelite']} | "
+            f"{m['nivel']} | T{m['tesela']} | "
+            f"nubes: {m['nubosidad']}"
+        )
+        print(f"  {nombre_zip}")
+
+        procesado = Path(CARPETA_PROCESADOS) / nombre_zip
+
+        if destino.exists():
+            fila["estado"] = "ya_existe"
+            print("  Ya existe; se omite.")
+
+        elif modo_original and procesado.exists():
+            fila["ruta"] = str(procesado)
+            fila["estado"] = "ya_procesado"
+            print("  Ya procesado; se omite.")
+
+        elif args.solo_listar:
+            fila["estado"] = "solo_listado"
+            print("  Solo listado; no se descarga.")
+
+        else:
+            try:
+                descargar_producto(
+                    producto, destino, usuario, password
+                )
+                fila["estado"] = "descargado"
+                print("  Descarga completada.")
+            except Exception as error:
+                fila["estado"] = "error"
+                fila["error"] = str(error)
+                print(f"  ERROR: {error}")
+
+        guardar_manifiesto(filas, ruta_manifiesto)
+
+    errores = sum(f["estado"] == "error" for f in filas)
+
+    print(f"\nManifiesto: {ruta_manifiesto}")
+    print(f"Productos con error: {errores}")
+
+    if modo_original and not args.solo_listar:
+        print("Puedes continuar con sesion5.py.")
+    else:
+        print(
+            "Las imágenes de calibración deben procesarse "
+            "en su flujo específico."
+        )
+
+    if errores:
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
